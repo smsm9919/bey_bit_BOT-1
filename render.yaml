@@ -1,75 +1,113 @@
 services:
   - type: web
-    name: dogee-bot-z
+    name: sol-bybit-bot
     env: python
     plan: free
     region: frankfurt
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python bot_bybit_smart.py
     healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.14
       - key: PORT
         value: 5000
+
+      # السوق/الرمز/الرافعة
+      - key: SYMBOL
+        value: SOL/USDT:USDT
       - key: INTERVAL
         value: 15m
-      - key: DECISION_EVERY_S
-        value: 30
-      - key: KEEPALIVE_SECONDS
-        value: 60
       - key: LEVERAGE
         value: 10
-      - key: LIVE_TRADING
-        value: "false"
-      - key: STRATEGY
-        value: smart
-      - key: SYMBOL
-        value: DOGE/USDT:USDT
-      - key: USE_TV_BAR
-        value: "false"
-      - key: FORCE_TV_ENTRIES
-        value: "false"
+      - key: POSITION_MODE
+        value: oneway
+      - key: RISK_ALLOC
+        value: "0.60"
+
+      # Range Filter (دخول)
       - key: RF_PERIOD
         value: "20"
       - key: RF_SOURCE
         value: close
       - key: RF_MULT
         value: "3.5"
-      - key: SPREAD_GUARD_BPS
+      - key: RF_LIVE_ONLY
+        value: "true"
+      - key: RF_HYST_BPS
         value: "6"
+
+      # مؤشرات أساسية
       - key: RSI_LEN
         value: "14"
       - key: ADX_LEN
         value: "14"
-      - key: TP1_PCT
+      - key: ATR_LEN
+        value: "14"
+      - key: MAX_SPREAD_BPS
+        value: "8"
+
+      # إدارة الصفقة
+      - key: TP1_PCT_BASE
         value: "0.40"
       - key: TP1_CLOSE_FRAC
         value: "0.50"
-      - key: TRAIL_ACTIVATE_PCT
-        value: "0.60"
-      - key: ATR_LEN
-        value: "14"
-      - key: ATR_MULT_TRAIL
-        value: "1.6"
-      - key: BREAKEVEN_AFTER_PCT
+      - key: BREAKEVEN_AFTER
         value: "0.30"
-      - key: COOLDOWN_AFTER_CLOSE_BARS
-        value: "0"
-      - key: USE_SMART_EXIT
-        value: "true"
-      - key: SCALE_IN_ENABLED
-        value: "true"
-      - key: SCALE_IN_ADX_MIN
-        value: "25"
-      - key: SCALE_IN_SLOPE_MIN
-        value: "0.50"
-      - key: SCALE_IN_MAX_ADDS
+      - key: TRAIL_ACTIVATE_PCT
+        value: "1.20"
+      - key: ATR_TRAIL_MULT
+        value: "1.6"
+      - key: FINAL_CHUNK_QTY
+        value: "0.2"      # 0.2 SOL
+      - key: RESIDUAL_MIN_QTY
+        value: "0.05"
+
+      # صبر/مجلس الإدارة
+      - key: MIN_HOLD_BARS
+        value: "2"
+      - key: BRK_CONFIRM_CLOSES
+        value: "1"
+      - key: BRK_MIN_VRATIO
+        value: "1.3"
+      - key: BRK_MIN_ADX
+        value: "22"
+      - key: RETEST_TIMEOUT_BARS
+        value: "6"
+      - key: DOJI_IGNORE_IN_DEFENSE
+        value: "1"
+      - key: DOJI_CONFIRM_BARS
+        value: "1"
+      - key: TRAP_RSI_OVERBOUGHT
+        value: "68"
+      - key: TRAP_RSI_OVERSOLD
+        value: "32"
+      - key: RCS_SMC_BPS
+        value: "12"
+
+      # EVX2 (الانفجار/الانهيار)
+      - key: EVX_V_SPIKE
+        value: "2.0"
+      - key: EVX_ATR_REACT
+        value: "1.4"
+      - key: EVX_ZSCORE
+        value: "1.8"
+
+      # دفاع إشارة RF معاكسة
+      - key: OPP_RF_VOTES_NEEDED
         value: "3"
-      - key: RENDER_EXTERNAL_URL
+      - key: OPP_RF_MIN_ADX
+        value: "25"
+      - key: OPP_RF_MIN_HYST_BPS
+        value: "8"
+
+      # Keepalive (اختياري) — سيُعطَّل لو فاضي
+      - key: SELF_URL
         value: ""
-      - key: BINGX_API_KEY
+
+      # أسرار Bybit (اضبطها من لوحة Render كـ Secret)
+      - key: BYBIT_API_KEY
         sync: false
-      - key: BINGX_API_SECRET
+      - key: BYBIT_API_SECRET
         sync: false

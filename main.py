@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-BYBIT Futures Bot — RF + EVX + Smart Mgmt (TV-matched)
+BYBIT Futures Bot — RF + EVX + TV-matched (All config in-code)
 - Exchange: Bybit linear USDT Perp via CCXT
-- TV-matching indicators: RMA(Wilder) for RSI/ADX/ATR, closed-bar option, source=close|hlc3
-- Range Filter entries (live or closed)
-- EVX (Explosion/Collapse) guard as entry filter + exit accelerator
-- Smart patience: confirmation-on-edges, doji/chop tolerance, strict-close + residual guard
-- Flask / /metrics /health
+- Indicators: RMA(Wilder) for ATR/RSI/ADX (مطابقة TV)
+- Entry: Range Filter (TV-like) + EVX كفلتر انفجار/انهيار
+- Management: TP1, Breakeven, ATR Trailing, Strict Close + Final chunk
+- API only reads BYBIT_API_KEY, BYBIT_API_SECRET, SELF_URL (optional), PORT (optional)
+- Endpoints: / , /metrics , /health
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -22,59 +22,62 @@ try:
 except Exception:
     def colored(t,*a,**k): return t
 
-# =================== ENV ===================
-EXCHANGE = os.getenv("EXCHANGE", "bybit").lower()
-SYMBOL   = os.getenv("SYMBOL", "SOL/USDT:USDT")     # Bybit linear USDT perp
-INTERVAL = os.getenv("INTERVAL", "15m")
+# =================== CONFIG (كلها جوه الكود) ===================
+# السوق والفريم
+EXCHANGE_NAME = "bybit"                  # ثابت
+SYMBOL        = "SOL/USDT:USDT"          # Bybit Linear USDT Perp
+INTERVAL      = "15m"
 
-# Risk & leverage
-LEVERAGE   = int(os.getenv("LEVERAGE", 10))
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
-POSITION_MODE = os.getenv("POSITION_MODE", "oneway")
+# رافعة ورسك
+LEVERAGE      = 10
+RISK_ALLOC    = 0.60                     # % من رأس المال × الرافعة
+POSITION_MODE = "oneway"
 
-# Range Filter (TV-like)
-RF_SOURCE = os.getenv("RF_SOURCE", "close").lower()  # kept for backward compatibility
-RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
-RF_MULT   = float(os.getenv("RF_MULT", 3.5))
-RF_LIVE_ONLY = str(os.getenv("RF_LIVE_ONLY","true")).lower()=="true"
-RF_HYST_BPS  = float(os.getenv("RF_HYST_BPS", 6.0))
+# Range Filter (مطابق TV قدر الإمكان)
+RF_PERIOD     = 20
+RF_MULT       = 3.5
+RF_LIVE_ONLY  = True                     # دخول على الشمعة الحية (غيّره لـ False لو عايز إشارات شمعة مُغلقة)
+RF_HYST_BPS   = 6.0                      # هسترة لمنع الفليك
 
-# TV matching
-TV_MATCH_MODE  = str(os.getenv("TV_MATCH_MODE","true")).lower()=="true"
-USE_CLOSED_ONLY= str(os.getenv("USE_CLOSED_ONLY","false")).lower()=="true"
-TV_SOURCE      = os.getenv("TV_SOURCE","close").lower()  # close|hlc3
-PRICE_FEED     = os.getenv("PRICE_FEED","last").lower()  # last|mark
-TZ             = os.getenv("TZ","UTC").upper()
+# مطابقة TradingView (منطق الحساب—not قيم من env)
+TV_USE_CLOSED_ONLY = False               # True = احسب المؤشرات على الشموع المُغلقة فقط
+TV_SOURCE          = "close"             # close | hlc3
+PRICE_FEED         = "last"              # last | mark
+TIMEZONE_LABEL     = "UTC"
 
-# Indicators
-RSI_LEN = int(os.getenv("RSI_LEN", 14))
-ADX_LEN = int(os.getenv("ADX_LEN", 14))
-ATR_LEN = int(os.getenv("ATR_LEN", 14))
+# مؤشرات
+RSI_LEN = 14
+ADX_LEN = 14
+ATR_LEN = 14
 
-# Guards
-SPREAD_GUARD_BPS = float(os.getenv("SPREAD_GUARD_BPS", 6.0))
-COOLDOWN_AFTER_CLOSE_BARS = int(os.getenv("COOLDOWN_AFTER_CLOSE_BARS", 0))
+# حمايات تنفيذ
+SPREAD_GUARD_BPS = 6.0
+COOLDOWN_AFTER_CLOSE_BARS = 0
 
-# Smart profit / trail
-TP1_PCT           = float(os.getenv("TP1_PCT", 0.40))
-TP1_CLOSE_FRAC    = float(os.getenv("TP1_CLOSE_FRAC", 0.50))
-BREAKEVEN_AFTER   = float(os.getenv("BREAKEVEN_AFTER_PCT", 0.30))
-TRAIL_ACTIVATE_PCT= float(os.getenv("TRAIL_ACTIVATE_PCT", 0.60))
-ATR_MULT_TRAIL    = float(os.getenv("ATR_MULT_TRAIL", 1.6))
+# ربح ذكي وتتبع
+TP1_PCT            = 0.40
+TP1_CLOSE_FRAC     = 0.50
+BREAKEVEN_AFTER    = 0.30
+TRAIL_ACTIVATE_PCT = 0.60
+ATR_MULT_TRAIL     = 1.6
 
-# EVX (explosion/implosion) filter
-EVX_ARM            = str(os.getenv("EVX_ARM","true")).lower()=="true"
-EVX_MIN_VOL_RATIO  = float(os.getenv("EVX_MIN_VOL_RATIO", 1.8))
-EVX_MIN_ATR_REACT  = float(os.getenv("EVX_MIN_ATR_REACT", 1.2))
-EVX_COOLDOWN_BARS  = int(os.getenv("EVX_COOLDOWN_BARS", 2))
+# فلتر EVX (انفجار/انهيار)
+EVX_ARM           = True
+EVX_MIN_VOL_RATIO = 1.8
+EVX_MIN_ATR_REACT = 1.2
+EVX_COOLDOWN_BARS = 2
 
-# Residual/final-chunk strict close qty
-FINAL_CHUNK_QTY = float(os.getenv("FINAL_CHUNK_QTY", 0.2))
+# غلق صارم عند المتبقي الصغير
+FINAL_CHUNK_QTY = 0.2
 
-# Pacing / Web
-BASE_SLEEP   = int(os.getenv("DECISION_EVERY_S", 30))
-SELF_URL     = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL","")
-PORT         = int(os.getenv("PORT", 5000))
+# إيقاع وحياة ويب
+DECISION_EVERY_S = 30
+PORT             = int(os.getenv("PORT", 5000))       # من env اختياري
+SELF_URL         = os.getenv("SELF_URL","")           # من env اختياري للكيبالايف
+
+# مفاتيح من ENV فقط (شرطك)
+API_KEY = os.getenv("BYBIT_API_KEY","")
+API_SECRET = os.getenv("BYBIT_API_SECRET","")
 
 # =================== LOGGING ===================
 def setup_file_logging():
@@ -87,23 +90,20 @@ def setup_file_logging():
         logger.addHandler(fh)
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
     print(colored("🗂️ log rotation ready","cyan"))
-
 setup_file_logging()
 
 # =================== EXCHANGE ===================
 def make_ex():
-    api_key = os.getenv(f"{EXCHANGE.upper()}_API_KEY","")
-    api_secret = os.getenv(f"{EXCHANGE.upper()}_API_SECRET","")
-    cls = getattr(ccxt, EXCHANGE)
+    cls = getattr(ccxt, EXCHANGE_NAME)
     return cls({
-        "apiKey": api_key,
-        "secret": api_secret,
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
         "enableRateLimit": True,
         "timeout": 20000,
         "options": {"defaultType":"swap", "adjustForTimeDifference": True}
     })
-
 ex = make_ex()
+
 MARKET = {}
 AMT_PREC = 0
 LOT_STEP = None
@@ -139,8 +139,6 @@ except Exception as e:
     print(colored(f"⚠️ exchange init: {e}","yellow"))
 
 # =================== HELPERS ===================
-_consec_err = 0
-
 def _round_amt(q):
     if q is None: return 0.0
     try:
@@ -168,14 +166,9 @@ def fmt(v, d=6, na="—"):
         return na
 
 def with_retry(fn, tries=3, base_wait=0.4):
-    global _consec_err
     for i in range(tries):
-        try:
-            r = fn()
-            _consec_err = 0
-            return r
+        try: return fn()
         except Exception:
-            _consec_err += 1
             if i == tries-1: raise
             time.sleep(base_wait*(2**i) + random.random()*0.25)
 
@@ -208,12 +201,11 @@ def price_now():
 def balance_usdt():
     try:
         b = with_retry(lambda: ex.fetch_balance(params={"type":"swap"}))
-        # Bybit USDT linear:
         total = b.get("USDT",{}).get("total")
         free  = b.get("USDT",{}).get("free")
         return float(total if total is not None else free)
     except Exception:
-        return 100.0  # paper fallback
+        return 100.0  # ورقي
 
 def orderbook_spread_bps():
     try:
@@ -245,12 +237,12 @@ def tv_source_series(df: pd.DataFrame) -> pd.Series:
 
 def compute_indicators(df: pd.DataFrame):
     d = df.copy()
-    if USE_CLOSED_ONLY and len(d)>=2:
+    if TV_USE_CLOSED_ONLY and len(d)>=2:
         d = d.iloc[:-1]
     if len(d) < max(ATR_LEN,RSI_LEN,ADX_LEN)+2:
         return {"rsi":50.0,"plus_di":0.0,"minus_di":0.0,"dx":0.0,"adx":0.0,"atr":0.0}
-    c = d["close"].astype(float); h=d["high"].astype(float); l=d["low"].astype(float)
 
+    c = d["close"].astype(float); h=d["high"].astype(float); l=d["low"].astype(float)
     tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
     atr = rma(tr, ATR_LEN)
 
@@ -267,20 +259,14 @@ def compute_indicators(df: pd.DataFrame):
     adx=rma(dx, ADX_LEN)
 
     i=len(d)-1
-    return {
-        "rsi": float(rsi.iloc[i]),
-        "plus_di": float(plus_di.iloc[i]),
-        "minus_di": float(minus_di.iloc[i]),
-        "dx": float(dx.iloc[i]),
-        "adx": float(adx.iloc[i]),
-        "atr": float(atr.iloc[i])
-    }
+    return {"rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
+            "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
+            "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])}
 
 # =================== RANGE FILTER (TV-like) ===================
 def _ema(s: pd.Series, n:int): return s.ewm(span=n, adjust=False).mean()
 def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
-    avrng = _ema((src - src.shift(1)).abs(), n)
-    wper = (n*2)-1
+    avrng = _ema((src - src.shift(1)).abs(), n); wper = (n*2)-1
     return _ema(avrng, wper) * qty
 
 def _rng_filter(src: pd.Series, rsize: pd.Series):
@@ -295,7 +281,7 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
 
 def rf_signal(df: pd.DataFrame):
     d = df.copy()
-    if USE_CLOSED_ONLY or not RF_LIVE_ONLY:
+    if TV_USE_CLOSED_ONLY or not RF_LIVE_ONLY:
         if len(d)>=2: d = d.iloc[:-1]
     if len(d) < RF_PERIOD + 3:
         px = float(d["close"].iloc[-1]) if len(d) else 0.0
@@ -315,16 +301,14 @@ def rf_signal(df: pd.DataFrame):
     long_flip  = (p_prev <= f_prev and p_now > f_now and _bps(p_now,f_now) >= RF_HYST_BPS)
     short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now,f_now) >= RF_HYST_BPS)
 
-    return {
-        "time": int(d["time"].iloc[-1]),
-        "price": p_now, "long": bool(long_flip), "short": bool(short_flip),
-        "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])
-    }
+    return {"time": int(d["time"].iloc[-1]), "price": p_now,
+            "long": bool(long_flip), "short": bool(short_flip),
+            "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])}
 
 # =================== EVX FILTER ===================
 def evx_signal(df: pd.DataFrame, ind: dict):
     d = df.copy()
-    if USE_CLOSED_ONLY and len(d)>=2:
+    if TV_USE_CLOSED_ONLY and len(d)>=2:
         d = d.iloc[:-1]
     if len(d) < 21: return {"ok": False, "dir":0, "ratio":0.0}
     v=float(d["volume"].iloc[-1]); vma=d["volume"].iloc[-21:-1].astype(float).mean() or 1e-9
@@ -340,7 +324,7 @@ STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
     "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-    "cooldown": 0, "evx_cool": 0
+    "cooldown": 0
 }
 compound_pnl = 0.0
 
@@ -379,16 +363,13 @@ def compute_size(balance, price):
 
 def open_market(side, qty, price):
     if qty<=0:
-        print(colored("❌ skip open (qty<=0)","red"))
-        return False
+        print(colored("❌ skip open (qty<=0)","red")); return False
     try:
         try: ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})
         except Exception: pass
         ex.create_order(SYMBOL, "market", side, qty, None, _params_open(side))
     except Exception as e:
-        print(colored(f"❌ open: {e}","red"))
-        logging.error(f"open_market error: {e}")
-        return False
+        print(colored(f"❌ open: {e}","red")); logging.error(f"open_market error: {e}"); return False
     STATE.update({
         "open": True, "side": "long" if side=="buy" else "short", "entry": price,
         "qty": qty, "bars": 0, "trail": None, "breakeven": None,
@@ -405,15 +386,13 @@ def _reset_after_close():
         "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0
     })
-    # cooldown
     STATE["cooldown"] = max(COOLDOWN_AFTER_CLOSE_BARS, STATE.get("cooldown",0))
 
 def close_market_strict(reason="STRICT"):
     global compound_pnl
     exch_qty, exch_side, exch_entry = _read_position()
     if exch_qty <= 0:
-        if STATE.get("open"):
-            _reset_after_close()
+        if STATE.get("open"): _reset_after_close()
         return
     side_to_close = "sell" if (exch_side=="long") else "buy"
     qty_to_close  = safe_qty(exch_qty)
@@ -432,12 +411,10 @@ def close_market_strict(reason="STRICT"):
             logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
             _reset_after_close()
             return
-        # residual → try again
         ex.create_order(SYMBOL,"market",side_to_close,safe_qty(left_qty),None,_params_close())
         _reset_after_close()
     except Exception as e:
-        print(colored(f"❌ strict close: {e}","red"))
-        logging.error(f"close_market_strict error: {e}")
+        print(colored(f"❌ strict close: {e}","red")); logging.error(f"close_market_strict error: {e}")
 
 def close_partial(frac, reason):
     if not STATE["open"] or STATE["qty"]<=0: return
@@ -448,10 +425,8 @@ def close_partial(frac, reason):
         print(colored(f"⏸️ skip partial (amount={fmt(qty_close,4)} < min_unit={fmt(min_unit,4)})","yellow"))
         return
     side = "sell" if STATE["side"]=="long" else "buy"
-    try:
-        ex.create_order(SYMBOL,"market",side,qty_close,None,_params_close())
-    except Exception as e:
-        print(colored(f"❌ partial close: {e}","red")); return
+    try: ex.create_order(SYMBOL,"market",side,qty_close,None,_params_close())
+    except Exception as e: print(colored(f"❌ partial close: {e}","red")); return
     STATE["qty"] = safe_qty(STATE["qty"] - qty_close)
     print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} rem={fmt(STATE['qty'],4)}","magenta"))
     if 0 < STATE["qty"] <= FINAL_CHUNK_QTY:
@@ -471,9 +446,8 @@ def manage_after_entry(df, ind, rf_info, evx):
         STATE["tp1_done"]=True
         if rr >= BREAKEVEN_AFTER: STATE["breakeven"]=entry
 
-    # EVX exit accelerator: لو كان انفجار قوي وعكس
+    # EVX exit accelerator: انفجار عكسي مع ربح
     if EVX_ARM and evx["ok"]:
-        # لو انفجار عكسي ضد اتجاهنا نحمي الربح/نقلل تعرض
         if (side=="long" and evx["dir"]<0 and rr>0) or (side=="short" and evx["dir"]>0 and rr>0):
             close_partial(0.40, "EVX-Accelerator")
             STATE["breakeven"]=entry
@@ -507,7 +481,7 @@ def time_to_candle_close(df: pd.DataFrame) -> int:
 def pretty_snapshot(bal, info, ind, spread_bps, evx, reason=None, df=None):
     left_s = time_to_candle_close(df) if df is not None else 0
     print(colored("─"*110,"cyan"))
-    print(colored(f"📊 {SYMBOL} {INTERVAL} • {'UTC' if TZ=='UTC' else TZ} • {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
+    print(colored(f"📊 {SYMBOL} {INTERVAL} • {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
     print(colored("─"*110,"cyan"))
     print("📈 RF & INDICATORS")
     print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))} | spread={fmt(spread_bps,2)} bps")
@@ -539,15 +513,15 @@ def trade_loop():
             evx = evx_signal(df, ind)
             spread_bps = orderbook_spread_bps()
 
-            # update pnl/highest
+            # highest profit tracker
             if STATE["open"] and px and STATE["entry"]:
                 rr = (px-STATE["entry"])/STATE["entry"]*100*(1 if STATE["side"]=="long" else -1)
                 if rr>STATE["highest_profit_pct"]: STATE["highest_profit_pct"]=rr
 
-            # manage after entry
+            # manage
             manage_after_entry(df, ind, {"price": px or rf["price"], **rf}, evx)
 
-            # entry logic
+            # entry
             reason=None
             if spread_bps is not None and spread_bps > SPREAD_GUARD_BPS:
                 reason=f"spread too high ({fmt(spread_bps,2)}bps > {SPREAD_GUARD_BPS})"
@@ -555,49 +529,49 @@ def trade_loop():
             if not STATE["open"] and reason is None:
                 sig = "buy" if rf["long"] else ("sell" if rf["short"] else None)
 
-                # cooldown after close
                 if STATE.get("cooldown",0)>0:
-                    STATE["cooldown"] -= 1 if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]) else 0
+                    # ينقص مع كل شمعة جديدة
+                    if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]):
+                        STATE["cooldown"] -= 1
                     sig=None; reason="cooldown"
 
-                # EVX as entry guard
-                if EVX_ARM and sig and not evx["ok"]:
-                    sig=None; reason="EVX guard"
+                # EVX guard
+                if EVX_ARM and sig:
+                    evx_now = evx_signal(df, ind)
+                    if not evx_now["ok"]:
+                        sig=None; reason="EVX guard"
 
                 if sig:
                     qty = compute_size(bal, px or rf["price"])
-                    if qty>0:
-                        open_market(sig, qty, px or rf["price"])
-                    else:
-                        reason="qty<=0"
+                    if qty>0: open_market(sig, qty, px or rf["price"])
+                    else: reason="qty<=0"
 
             # bar counter
             if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]) and STATE["open"]:
                 STATE["bars"] += 1
 
             pretty_snapshot(bal, {"price": px or rf["price"], **rf}, ind, spread_bps, evx, reason, df)
-
-            time.sleep(BASE_SLEEP)
+            time.sleep(DECISION_EVERY_S)
         except Exception as e:
             print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}","red"))
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
-            time.sleep(BASE_SLEEP)
+            time.sleep(DECISION_EVERY_S)
 
 # =================== API ===================
 app = Flask(__name__)
 @app.route("/")
 def home():
-    mode = "LIVE" if (os.getenv(f"{EXCHANGE.upper()}_API_KEY","") and os.getenv(f"{EXCHANGE.upper()}_API_SECRET","")) else "PAPER"
-    return f"✅ BYBIT RF+EVX — {SYMBOL} {INTERVAL} — {mode} — TV_MATCH={TV_MATCH_MODE} — ClosedOnly={USE_CLOSED_ONLY} — EVX={EVX_ARM}"
+    mode = "LIVE" if (API_KEY and API_SECRET) else "PAPER"
+    return f"✅ BYBIT RF+EVX — {SYMBOL} {INTERVAL} — {mode} — RF_LIVE={RF_LIVE_ONLY} — TV_CLOSED_ONLY={TV_USE_CLOSED_ONLY}"
 
 @app.route("/metrics")
 def metrics():
     return jsonify({
-        "exchange": EXCHANGE, "symbol": SYMBOL, "interval": INTERVAL,
+        "exchange": EXCHANGE_NAME, "symbol": SYMBOL, "interval": INTERVAL,
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "guards": {"spread_bps": SPREAD_GUARD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
-        "tv": {"match": TV_MATCH_MODE, "source": TV_SOURCE, "use_closed_only": USE_CLOSED_ONLY, "price_feed": PRICE_FEED}
+        "tv": {"source": TV_SOURCE, "use_closed_only": TV_USE_CLOSED_ONLY, "price_feed": PRICE_FEED}
     })
 
 @app.route("/health")
@@ -610,8 +584,7 @@ def health():
 def keepalive_loop():
     url=(SELF_URL or "").strip().rstrip("/")
     if not url:
-        print(colored("⛔ keepalive disabled (SELF_URL not set)","yellow"))
-        return
+        print(colored("⛔ keepalive disabled (SELF_URL not set)","yellow")); return
     import requests
     sess=requests.Session(); sess.headers.update({"User-Agent":"bybit-rf-evx/keepalive"})
     print(colored(f"KEEPALIVE every 50s → {url}","cyan"))
@@ -622,9 +595,9 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    print(colored(f"MODE: {'LIVE' if (os.getenv(f'{EXCHANGE.upper()}_API_KEY','') and os.getenv(f'{EXCHANGE.upper()}_API_SECRET','')) else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}","yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}  •  TV_MATCH={TV_MATCH_MODE}  •  USE_CLOSED_ONLY={USE_CLOSED_ONLY}","yellow"))
-    print(colored(f"ENTRY: RF{' (EVX guarded)' if EVX_ARM else ''}  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}","yellow"))
+    print(colored(f"MODE: {'LIVE' if (API_KEY and API_SECRET) else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}","yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}  •  TV_CLOSED_ONLY={TV_USE_CLOSED_ONLY}","yellow"))
+    print(colored(f"ENTRY: RF{' + EVX' if EVX_ARM else ''}  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}","yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))

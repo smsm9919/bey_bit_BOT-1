@@ -6,15 +6,15 @@ services:
     region: frankfurt
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_bybit_smart.py
+    startCommand: python main.py        # ← كان bot_bybit_smart.py
     healthCheckPath: /
     envVars:
-      - key: PYTHON_VERSION
+      - key: PYTHON_VERSION             # ← key (مش keys)
         value: 3.10.14
       - key: PORT
         value: 5000
 
-      # السوق/الرمز/الرافعة
+      # السوق/الإعدادات
       - key: SYMBOL
         value: SOL/USDT:USDT
       - key: INTERVAL
@@ -26,11 +26,11 @@ services:
       - key: RISK_ALLOC
         value: "0.60"
 
-      # Range Filter (دخول)
-      - key: RF_PERIOD
-        value: "20"
+      # Range Filter
       - key: RF_SOURCE
         value: close
+      - key: RF_PERIOD
+        value: "20"
       - key: RF_MULT
         value: "3.5"
       - key: RF_LIVE_ONLY
@@ -38,7 +38,7 @@ services:
       - key: RF_HYST_BPS
         value: "6"
 
-      # مؤشرات أساسية
+      # مؤشرات
       - key: RSI_LEN
         value: "14"
       - key: ADX_LEN
@@ -59,55 +59,13 @@ services:
         value: "1.20"
       - key: ATR_TRAIL_MULT
         value: "1.6"
-      - key: FINAL_CHUNK_QTY
-        value: "0.2"      # 0.2 SOL
-      - key: RESIDUAL_MIN_QTY
-        value: "0.05"
 
-      # صبر/مجلس الإدارة
-      - key: MIN_HOLD_BARS
-        value: "2"
-      - key: BRK_CONFIRM_CLOSES
-        value: "1"
-      - key: BRK_MIN_VRATIO
-        value: "1.3"
-      - key: BRK_MIN_ADX
-        value: "22"
-      - key: RETEST_TIMEOUT_BARS
-        value: "6"
-      - key: DOJI_IGNORE_IN_DEFENSE
-        value: "1"
-      - key: DOJI_CONFIRM_BARS
-        value: "1"
-      - key: TRAP_RSI_OVERBOUGHT
-        value: "68"
-      - key: TRAP_RSI_OVERSOLD
-        value: "32"
-      - key: RCS_SMC_BPS
-        value: "12"
-
-      # EVX2 (الانفجار/الانهيار)
-      - key: EVX_V_SPIKE
-        value: "2.0"
-      - key: EVX_ATR_REACT
-        value: "1.4"
-      - key: EVX_ZSCORE
-        value: "1.8"
-
-      # دفاع إشارة RF معاكسة
-      - key: OPP_RF_VOTES_NEEDED
-        value: "3"
-      - key: OPP_RF_MIN_ADX
-        value: "25"
-      - key: OPP_RF_MIN_HYST_BPS
-        value: "8"
-
-      # Keepalive (اختياري) — سيُعطَّل لو فاضي
-      - key: SELF_URL
-        value: ""
-
-      # أسرار Bybit (اضبطها من لوحة Render كـ Secret)
+      # أسرار Bybit (ضيفها من Secrets)
       - key: BYBIT_API_KEY
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
+
+      # Keepalive اختياري
+      - key: SELF_URL
+        value: ""

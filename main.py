@@ -42,7 +42,7 @@ POSITION_MODE = "oneway"
 RF_SOURCE   = "close"
 RF_PERIOD   = 20
 RF_MULT     = 3.5
-RF_HYST_BPS = 6.0           # hysteresis bps for flip
+RF_HYST_BPS = 0.0           # hysteresis bps for flip
 RF_CLOSED_ONLY = True       # <-- دخول على الشمعة المغلقة فقط
 
 # Indicators (RMA/Wilder - TV compat)

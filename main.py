@@ -130,7 +130,7 @@ except Exception as e:
 compound_pnl = 0.0
 wait_for_next_signal_side = None   # بعد الإغلاق: انتظر إشارة RF المعاكسة (يُحدّث عند الإغلاق)
 last_adx_peak = None               # تتبع قمة ADX الأخيرة لأغراض التبريد
-cond_ini = 0                       # مطابق لـ CondIni في Pine (1 آخر اتجاه LONG، -1 آخر اتجاه SHORT)
+cond_ini = None                    # نبوّتستراب من التاريخ لكي يطابق Pine
 
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
@@ -315,7 +315,6 @@ def rf_signal_closed_pine(df: pd.DataFrame):
     # last CLOSED candle index
     k, km1 = -2, -3
     p_k   = float(src.iloc[k])
-    p_km1 = float(src.iloc[km1])
     f_k   = float(filt.iloc[k])
     f_km1 = float(filt.iloc[km1])
 
@@ -324,12 +323,11 @@ def rf_signal_closed_pine(df: pd.DataFrame):
     downward = 1 if f_k < f_km1 else 0
 
     # Pine long/short prelim conditions
-    # (النسخة الأصلية فيها شرط إضافي على src[1] لكن الناتج النهائي يعتمد CondIni)
     longCond  = (p_k > f_k) and (upward > 0)
     shortCond = (p_k < f_k) and (downward > 0)
 
     # CondIni update like Pine
-    prev_cond = cond_ini
+    prev_cond = cond_ini if cond_ini is not None else 0
     new_cond  = 1 if longCond else (-1 if shortCond else prev_cond)
 
     # Pine final signals
@@ -347,6 +345,53 @@ def rf_signal_closed_pine(df: pd.DataFrame):
         "hi": float(hi.iloc[k]),
         "lo": float(lo.iloc[k]),
     }
+
+# -------- Bootstrap CondIni from closed history (Pine-exact) ----------
+def bootstrap_cond_ini_from_history(df: pd.DataFrame):
+    """يبني CondIni من الشموع المغلقة حتى ما قبل الأخيرة ليطابق Pine."""
+    global cond_ini
+    try:
+        if len(df) < RF_PERIOD + 3:
+            cond_ini = 0 if cond_ini is None else cond_ini
+            return
+        src = df[RF_SOURCE].astype(float)
+
+        def _ema(s, span): return s.ewm(span=span, adjust=False).mean()
+        def _rng_size(x, qty, per):
+            wper = (per * 2) - 1
+            avrng = _ema((x - x.shift(1)).abs(), per)
+            return _ema(avrng, wper) * qty
+        def _rng_filter(x, r):
+            rf = [float(x.iloc[0])]
+            for i in range(1, len(x)):
+                prev = rf[-1]
+                xi = float(x.iloc[i]); ri = float(r.iloc[i]); cur = prev
+                if xi - ri > prev: cur = xi - ri
+                if xi + ri < prev: cur = xi + ri
+                rf.append(cur)
+            return pd.Series(rf, index=x.index, dtype="float64")
+
+        r = _rng_size(src, RF_MULT, RF_PERIOD)
+        filt = _rng_filter(src, r)
+
+        ci = 0
+        # نمشي من أول نقطة متاحة حتى ما قبل آخر بار (كلها شموع مغلقة)
+        for i in range(RF_PERIOD + 2, len(df) - 0):  # آخر بار في df_closed مغلق
+            if i-1 < 0: continue
+            p_k   = float(src.iloc[i])
+            f_k   = float(filt.iloc[i])
+            f_km1 = float(filt.iloc[i-1])
+            upward   = 1 if f_k > f_km1 else 0
+            downward = 1 if f_k < f_km1 else 0
+            longCond  = (p_k > f_k) and (upward > 0)
+            shortCond = (p_k < f_k) and (downward > 0)
+            ci = 1 if longCond else (-1 if shortCond else ci)
+
+        cond_ini = ci
+        print(colored(f"🔧 CondIni bootstrapped from history → {cond_ini}", "cyan"))
+    except Exception as e:
+        print(colored(f"⚠️ bootstrap CondIni error: {e}", "yellow"))
+        if cond_ini is None: cond_ini = 0
 
 # =================== PATTERNS / SMC / SDZ / EVX ===================
 def detect_candle(df: pd.DataFrame):
@@ -738,6 +783,11 @@ def trade_loop():
             bal = balance_usdt()
             px  = price_now()
             df  = fetch_ohlcv()
+
+            # أول تشغيل فقط: ابنِ CondIni من التاريخ المغلق ليطابق Pine
+            if cond_ini is None:
+                df_closed_init = df.iloc[:-1] if len(df) >= 2 else df.copy()
+                bootstrap_cond_ini_from_history(df_closed_init)
 
             # RF Pine-exact on CLOSED candle
             info = rf_signal_closed_pine(df)

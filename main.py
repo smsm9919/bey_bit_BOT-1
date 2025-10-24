@@ -42,8 +42,8 @@ POSITION_MODE = "oneway"
 RF_SOURCE   = "close"
 RF_PERIOD   = 20
 RF_MULT     = 3.5
-RF_HYST_BPS = 0.0           # hysteresis bps for flip
-RF_CLOSED_ONLY = True       # <-- دخول على الشمعة المغلقة فقط
+RF_HYST_BPS = 0.0           # (غير مستخدم في منطق TV)
+RF_CLOSED_ONLY = True       # دخول على الشمعة المغلقة فقط
 
 # Indicators (RMA/Wilder - TV compat)
 RSI_LEN = 14
@@ -53,16 +53,16 @@ ATR_LEN = 14
 # Final chunk strict close threshold (contracts)
 FINAL_CHUNK_QTY = 0.2
 
-# Council thresholds (يمكن تعديلها بحذر)
-COUNCIL_MIN_VOTES_FOR_STRICT = 3         # عدد إشارات من المجلس مطلوبة لتأكيد الخروج
-LEVEL_NEAR_BPS               = 10.0      # قرب من مستوى SMC/SDZ بالـbps
-EVX_STRONG_RATIO             = 1.8       # انفجار حجم
-EVX_BODY_ATR_MIN             = 1.2       # جسم/ATR
-EVX_COOL_OFF_RATIO           = 1.1       # تبريد الانفجار
-ADX_COOL_OFF_DROP            = 2.0       # هبوط ADX ≥ 2 نقاط من قمة قريبة
+# Council thresholds
+COUNCIL_MIN_VOTES_FOR_STRICT = 3
+LEVEL_NEAR_BPS               = 10.0
+EVX_STRONG_RATIO             = 1.8
+EVX_BODY_ATR_MIN             = 1.2
+EVX_COOL_OFF_RATIO           = 1.1
+ADX_COOL_OFF_DROP            = 2.0
 RSI_NEUTRAL_MIN, RSI_NEUTRAL_MAX = 45.0, 55.0
-RETEST_MAX_BARS              = 6         # أعظم عدد شموع لمراقبة إعادة الاختبار
-CHOP_ATR_PCTL                = 0.25      # لو ATR ضمن رُبع التوزيع الأخير => سوق نايم
+RETEST_MAX_BARS              = 6
+CHOP_ATR_PCTL                = 0.25
 
 # Pacing
 BASE_SLEEP   = 5
@@ -129,13 +129,13 @@ except Exception as e:
 # =================== HELPERS / STATE ===================
 compound_pnl = 0.0
 wait_for_next_signal_side = None   # بعد الإغلاق: انتظر إشارة RF المعاكسة
-last_adx_peak = None               # تتبع قمة ADX الأخيرة لأغراض التبريد
+last_adx_peak = None               # تتبع قمة ADX الأخيرة
 
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
     "pnl": 0.0, "bars": 0,
     "highest_profit_pct": 0.0,
-    "breakeven": None,  # غير مستخدمة الآن ولكن نعرضها في اللوج
+    "breakeven": None,
     "council": {"votes": 0, "reasons": []}
 }
 
@@ -224,12 +224,12 @@ def compute_indicators(df: pd.DataFrame):
         return {"rsi":None,"plus_di":None,"minus_di":None,"dx":None,"adx":None,"atr":None,"atr_pctl":None}
     c = df["close"].astype(float); h=df["high"].astype(float); l=df["low"].astype(float)
 
-    # RSI (RMA/Wilder)
+    # RSI
     delta=c.diff(); up=delta.clip(lower=0.0); dn=(-delta).clip(lower=0.0)
     rma_up=_rma(up, RSI_LEN); rma_dn=_rma(dn, RSI_LEN).replace(0,1e-12)
     rs=rma_up/rma_dn; rsi=100-(100/(1+rs))
 
-    # ADX (RMA/Wilder)
+    # ADX
     up_move=h.diff(); down_move=l.shift(1)-l
     plus_dm=up_move.where((up_move>down_move)&(up_move>0),0.0)
     minus_dm=down_move.where((down_move>up_move)&(down_move>0),0.0)
@@ -239,7 +239,7 @@ def compute_indicators(df: pd.DataFrame):
     dx=(100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0.0)
     adx=_rma(dx, ADX_LEN)
 
-    # ATR percentile (chop detector)
+    # ATR percentile (chop)
     atr_hist = _rma(tr, ATR_LEN)
     atr_pctl = None
     try:
@@ -250,7 +250,6 @@ def compute_indicators(df: pd.DataFrame):
     except Exception:
         atr_pctl = None
 
-    # track last adx peak
     try:
         cur_adx = float(adx.iloc[-1])
         if last_adx_peak is None or cur_adx > last_adx_peak:
@@ -283,37 +282,77 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
     return filt + rsize, filt - rsize, filt
 
 def rf_signal_closed(df: pd.DataFrame):
-    """Flip detected on LAST CLOSED candle only."""
+    """
+    TradingView RF – B&S Signals (CLOSED candle) replication:
+    - fdir := filt>filt[1]?1 : filt<filt[1]?-1 : fdir[1]
+    - upward = fdir==1 ; downward = fdir==-1
+    - longCond  = (src>filt and upward)
+      shortCond = (src<filt and downward)
+    - CondIni := longCond ? 1 : shortCond ? -1 : CondIni[1]
+    - longCondition  = longCond  and CondIni[1]==-1
+      shortCondition = shortCond and CondIni[1]== 1
+    Signal is evaluated on the LAST CLOSED candle (index -2).
+    """
     if len(df) < RF_PERIOD + 3:
         i=-1; price=float(df["close"].iloc[i]) if len(df) else None
         return {"time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
                 "price": price or 0.0, "long": False, "short": False,
                 "filter": price or 0.0, "hi": price or 0.0, "lo": price or 0.0}
+
     src = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
 
-    def _bps(a,b):
-        try: return abs((a-b)/b)*10000.0
-        except Exception: return 0.0
+    # نبني سلاسل fdir/CondIni على كل الشموع المغلقة
+    n = len(df)
+    fdir = np.zeros(n, dtype=int)
+    cond_ini = np.zeros(n, dtype=int)
 
-    # نستخدم آخر شمعة مُغلقة: idx=-2 مقارنة بـ -3
-    p_now=float(src.iloc[-2]); p_prev=float(src.iloc[-3])
-    f_now=float(filt.iloc[-2]); f_prev=float(filt.iloc[-3])
+    for i in range(1, n):
+        if filt.iloc[i] > filt.iloc[i-1]:
+            fdir[i] = 1
+        elif filt.iloc[i] < filt.iloc[i-1]:
+            fdir[i] = -1
+        else:
+            fdir[i] = fdir[i-1]
 
-    long_flip  = (p_prev <= f_prev and p_now > f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
-    short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
+        upward   = (fdir[i] == 1)
+        downward = (fdir[i] == -1)
+        longCond  = (src.iloc[i] > filt.iloc[i])  and upward
+        shortCond = (src.iloc[i] < filt.iloc[i])  and downward
+
+        if longCond:
+            cond_ini[i] = 1
+        elif shortCond:
+            cond_ini[i] = -1
+        else:
+            cond_ini[i] = cond_ini[i-1]
+
+    # نستخدم آخر شمعة مُغلقة: idx = -2
+    i = n - 2
+    prev_cond = cond_ini[i-1] if i-1 >= 0 else 0
+    upward_i   = (fdir[i] == 1)
+    downward_i = (fdir[i] == -1)
+    longCond_i  = (src.iloc[i] > filt.iloc[i]) and upward_i
+    shortCond_i = (src.iloc[i] < filt.iloc[i]) and downward_i
+
+    long_flip  = bool(longCond_i  and (prev_cond == -1))
+    short_flip = bool(shortCond_i and (prev_cond ==  1))
 
     return {
-        "time": int(df["time"].iloc[-2]), "price": float(src.iloc[-1]),  # price الحالي للعرض فقط
-        "long": bool(long_flip), "short": bool(short_flip),
-        "filter": f_now, "hi": float(hi.iloc[-2]), "lo": float(lo.iloc[-2])
+        "time": int(df["time"].iloc[i]),
+        "price": float(src.iloc[-1]),  # السعر الحالي للعرض
+        "long": long_flip,
+        "short": short_flip,
+        "filter": float(filt.iloc[i]),
+        "hi": float(hi.iloc[i]),
+        "lo": float(lo.iloc[i]),
     }
 
 # =================== PATTERNS / SMC / SDZ / EVX ===================
 def detect_candle(df: pd.DataFrame):
     if len(df)<3: return {"pattern":"NONE","strength":0,"dir":0}
     o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
-    l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])  # آخر شمعة مُغلقة
+    l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
     rng=max(h-l,1e-12); body=abs(c-o)
     upper=h-max(o,c); lower=min(o,c)-l
     upper_pct=upper/rng*100.0; lower_pct=lower/rng*100.0; body_pct=body/rng*100.0
@@ -346,7 +385,6 @@ def _nearest_level(px, levels, bps=LEVEL_NEAR_BPS):
     return None
 
 def detect_smc_levels(df: pd.DataFrame):
-    """EQH/EQL + simple OB + simple FVG + SDZ (supply/demand zones from swing bodies)."""
     try:
         d = df.copy()
         ph, pl = _find_swings(d, 2, 2)
@@ -365,7 +403,6 @@ def detect_smc_levels(df: pd.DataFrame):
         eqh = _eq(ph, True)
         eql = _eq(pl, False)
 
-        # OB (آخر شمعة قوية)
         ob = None
         for i in range(len(d)-3, max(len(d)-50, 1), -1):
             o=float(d["open"].iloc[i]); c=float(d["close"].iloc[i])
@@ -377,7 +414,6 @@ def detect_smc_levels(df: pd.DataFrame):
                 ob={"side":side,"bot":min(o,c),"top":max(o,c),"time":int(d["time"].iloc[i])}
                 break
 
-        # FVG (بسيط)
         fvg=None
         for i in range(len(d)-3, max(len(d)-30, 2), -1):
             prev_high = float(d["high"].iloc[i-1]); prev_low = float(d["low"].iloc[i-1])
@@ -387,10 +423,8 @@ def detect_smc_levels(df: pd.DataFrame):
             if curr_high < prev_low:
                 fvg={"type":"BEAR_FVG","bottom":curr_high,"top":prev_low}; break
 
-        # SDZ: مناطق عرض/طلب مبسطة من أجسام السوينجز السابقة
         sdz = None
         try:
-            # خذ آخر swing قوي للجسم
             idxs = [i for i,v in enumerate(ph) if v is not None] + [i for i,v in enumerate(pl) if v is not None]
             if idxs:
                 focus = max(idxs)
@@ -408,7 +442,6 @@ def detect_smc_levels(df: pd.DataFrame):
 def explosion_signal(df: pd.DataFrame, ind: dict):
     if len(df)<21: return {"explosion":False,"dir":0,"ratio":0.0}
     try:
-        # استخدم آخر شمعة مُغلقة
         o=float(df["open"].iloc[-2]); c=float(df["close"].iloc[-2])
         v=float(df["volume"].iloc[-2]); vma=df["volume"].iloc[-22:-2].astype(float).mean() or 1e-9
         atr=float(ind.get("atr") or 0.0)
@@ -424,10 +457,8 @@ def near_level(px, lvl, bps=LEVEL_NEAR_BPS):
     except Exception: return False
 
 def detect_fake_break(df: pd.DataFrame, smc: dict):
-    """كسر وهمي: اختراق هاي/لو ثم إغلاق داخل/رفض واضح مع فتيل طويل وحجم أعلى من المعتاد."""
     if len(df)<4: return {"fake_break": False, "side": None}
     try:
-        # ننظر للشمعة المغلقة الأخيرة
         o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
         l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
         prev_h=float(df["high"].iloc[-3]); prev_l=float(df["low"].iloc[-3])
@@ -447,22 +478,17 @@ def detect_fake_break(df: pd.DataFrame, smc: dict):
     return {"fake_break": False, "side": None}
 
 def detect_retest(df: pd.DataFrame, level: float, side: str):
-    """إعادة اختبار بسيطة خلال RE-TEST window."""
     try:
         if level is None: return False
-        # راقب آخر RE-TEST window من الشموع المغلقة
         closes = df["close"].astype(float).iloc[-(RETEST_MAX_BARS+1):-1].values
         if side=="long":
-            # بعد كسر مستوى مقاومة، نريد هبوط طفيف يلمس قريب المستوى ثم ارتداد
             return any(near_level(px, level) for px in closes)
         else:
-            # بعد كسر دعم، نريد صعود طفيف يلمس قريب المستوى ثم رفض
             return any(near_level(px, level) for px in closes)
     except Exception:
         return False
 
 def detect_trap(df: pd.DataFrame, smc: dict):
-    """Stop-hunt/Trap: فتائل طويلة عند EQH/EQL/OB/SDZ + حجم أعلى."""
     if len(df)<3: return None
     try:
         o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
@@ -486,11 +512,10 @@ def detect_trap(df: pd.DataFrame, smc: dict):
 
 # =================== COUNCIL DECISION ===================
 def council_assess(df, ind, info, smc, cache):
-    """يرجع قرار المجلس: hold / exit_strict + الأسباب (votes)"""
     votes = []
     price = info.get("price")
 
-    # 1) قرب مستويات سيولة/هيكلة (EQH/EQL/OB/SDZ/FVG)
+    # 1) قرب مستويات
     near_any = False
     try:
         lvls = []
@@ -509,21 +534,20 @@ def council_assess(df, ind, info, smc, cache):
     except Exception:
         pass
 
-    # 2) شمعة رفض/تعب (منذ الشمعة المغلقة الأخيرة)
+    # 2) شمعة رفض/تعب
     cndl = detect_candle(df)
     if cndl["pattern"] in ("SHOOTING","HAMMER") or (cndl["pattern"]=="DOJI" and near_any):
         votes.append(f"candle_reject:{cndl['pattern']}")
 
-    # 3) انفجار ثم تبريد (EVX → cool-off)
+    # 3) انفجار ثم تبريد
     evx = explosion_signal(df, ind)
     if evx["explosion"]:
         votes.append("evx_strong")
     else:
-        # تبريد بعد انفجار سابق (بسيط: حجم قريب من المتوسط + جسم/ATR هادئ)
         if evx["ratio"] <= EVX_COOL_OFF_RATIO:
             votes.append("evx_cool")
 
-    # 4) تبريد زخم: ADX هابط من قمة قريبة أو RSI محايد
+    # 4) تبريد زخم
     try:
         adx = float(ind.get("adx") or 0.0); rsi=float(ind.get("rsi") or 50.0)
         if last_adx_peak is not None and (last_adx_peak - adx) >= ADX_COOL_OFF_DROP:
@@ -533,31 +557,28 @@ def council_assess(df, ind, info, smc, cache):
     except Exception:
         pass
 
-    # 5) كسر وهمي / إعادة اختبار فاشلة
+    # 5) كسر وهمي / إعادة اختبار
     fk = detect_fake_break(df, smc)
     if fk["fake_break"]:
         votes.append(f"fake_break:{fk['side']}")
-    # re-test: إذا كانت الصفقة long وتجاوزت EQH/OB، ابحث عن retest؛ والعكس للـ short
     side = STATE.get("side")
     l_for_retest = smc.get("eqh") if side=="long" else smc.get("eql")
     if detect_retest(df, l_for_retest, "long" if side=="long" else "short"):
         votes.append("retest_touched")
 
-    # 6) سوق نايم (chop) + تذبذب وفتائل عند المستويات ⇒ خروج على ربح منطقي بدل الانتظار
+    # 6) سوق نايم قرب مستوى
     atr_pctl = ind.get("atr_pctl")
     if atr_pctl is not None and atr_pctl <= CHOP_ATR_PCTL and near_any and cndl["pattern"] in ("DOJI","SHOOTING","HAMMER"):
         votes.append("chop_near_level")
 
-    # 7) فخاخ سيولة
+    # 7) فخاخ
     trp = detect_trap(df, smc)
     if trp: votes.append(f"trap:{trp['trap']}")
 
-    # احتساب القرار
     decision = "hold"
     if len(votes) >= COUNCIL_MIN_VOTES_FOR_STRICT:
         decision = "exit_strict"
 
-    # حفظ تفاصيل المجلس في الحالة
     STATE["council"] = {"votes": len(votes), "reasons": votes}
     return {"decision": decision, "votes": votes}
 
@@ -656,7 +677,6 @@ def _reset_after_close(reason, prev_side=None):
         "pnl": 0.0, "bars": 0, "highest_profit_pct": 0.0,
         "breakeven": None, "council": {"votes":0,"reasons":[]}
     })
-    # انتظر إشارة RF المعاكسة قبل دخول جديد
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
     else: wait_for_next_signal_side = None
@@ -664,19 +684,14 @@ def _reset_after_close(reason, prev_side=None):
 
 # =================== COUNCIL-DRIVEN MANAGEMENT ===================
 def manage_after_entry(df, ind, info, smc):
-    """بدون TPs وبدون Trailing. المجلس فقط يقرر الخروج الصارم عند أقوى سبب منطقي."""
     if not STATE["open"] or STATE["qty"]<=0: return
     px = info["price"]; entry=STATE["entry"]; side=STATE["side"]
     rr = (px - entry)/entry*100*(1 if side=="long" else -1)
 
-    # أعلى ربح مُسجّل
     if rr > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = rr
 
-    # تقييم المجلس
     decision = council_assess(df, ind, info, smc, STATE.get("council", {}))
-
-    # لو المجلس قرر خروج صارم → أغلق بالكامل
     if decision["decision"] == "exit_strict":
         close_market_strict("COUNCIL_MAX_PROFIT_CONFIRMED")
         return
@@ -721,18 +736,15 @@ def trade_loop():
             px  = price_now()
             df  = fetch_ohlcv()
 
-            info = rf_signal_closed(df)            # RF على الشمعة المُغلقة فقط
+            info = rf_signal_closed(df)            # RF على الشمعة المُغلقة فقط (TV logic)
             ind  = compute_indicators(df)
 
-            # SMC على تاريخ مغلق فقط (استبعاد الشمعة الحالية)
             df_closed = df.iloc[:-1] if len(df)>=2 else df.copy()
             smc = detect_smc_levels(df_closed)
 
-            # تحديث PnL الحالي
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
 
-            # إدارة الصفقة بالمجلس
             manage_after_entry(df, ind, {"price": px or info["price"], **info}, smc)
 
             # ENTRY: RF CLOSED ONLY — مع انتظار الإشارة المعاكسة بعد الإغلاق
@@ -754,7 +766,6 @@ def trade_loop():
 
             pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, smc, reason, df)
 
-            # عداد البارات
             if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]) and STATE["open"]:
                 STATE["bars"] += 1
 
@@ -807,7 +818,7 @@ def keepalive_loop():
 # =================== BOOT ===================
 if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ENTRY=RF_CLOSED_ONLY", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ENTRY=RF_CLOSED_ONLY (TV logic)", "yellow"))
     print(colored(f"NO TPs/NO TRAIL • STRICT EXIT by COUNCIL • FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

@@ -43,7 +43,7 @@ RF_SOURCE   = "close"
 RF_PERIOD   = 20
 RF_MULT     = 3.5
 RF_HYST_BPS = 0.0           # (غير مستخدم في منطق TV)
-RF_CLOSED_ONLY = True       # دخول على الشمعة المغلقة فقط
+RF_CLOSED_ONLY = False       # دخول على الشمعة المغلقة فقط
 
 # Indicators (RMA/Wilder - TV compat)
 RSI_LEN = 14

@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-BYBIT — RF-CLOSE FUSION + Full-Consensus Council
+BYBIT — RF-CLOSE FUSION (Pine-exact) + Council Full-Consensus + True Bottom/Top Detection
 • Exchange: Bybit USDT Perps via CCXT
-• Entry: Range Filter (Pine-exact, CLOSED-candle) + Supply/Demand zones
-• Full-Consensus: لا دخول/عكس إلا بعد إجماع أركان التأكيد (Momentum/Structure/Candles/EVX/RF/RSI/ATR activity/Edge distance)
-• Management: Council strict exit + Trend ride إلى الصندوق المقابل + Demand Guard
-• No partial TPs / No trailing — strict exits فقط
-• Flask endpoints: / , /metrics , /health
+• Entry: Range Filter (TradingView-like, CLOSED-candle), AND/OR Supply/Demand zones
+• Council: Full-Consensus gate; zones don't require ADX (to catch real bottoms), RF keeps ADX/EVX requirement
+• Structure: Confirmed Bottom (HL+BOS up) / Confirmed Top (LH+BOS down)
+• Continuations: Supply breakout → Buy; Demand breakdown → Sell (with consensus)
+• No partial TPs, no trailing. Strict exits by council / trend target reject / demand guard
+• Flask: / , /metrics , /health
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -39,18 +40,18 @@ LEVERAGE        = 10
 RISK_ALLOC      = 0.60
 POSITION_MODE   = "oneway"
 
-# Range Filter (TV-like core, Pine-exact signals على الشمعة المغلقة)
+# Range Filter (TV-like Pine) — CLOSED candle only
 RF_SOURCE       = "close"
 RF_PERIOD       = 20
 RF_MULT         = 3.5
-RF_CLOSED_ONLY  = True     # Pine-exact — إشارة على الشمعة المغلقة فقط
+RF_CLOSED_ONLY  = True
 
 # Indicators (TV-Compat)
 RSI_LEN = 14
 ADX_LEN = 14
 ATR_LEN = 14
 
-# Council legacy (للخروج الصارم)
+# Council legacy (for exits)
 COUNCIL_MIN_VOTES_FOR_STRICT = 3
 LEVEL_NEAR_BPS               = 10.0
 EVX_STRONG_RATIO             = 1.8
@@ -61,31 +62,36 @@ RSI_NEUTRAL_MIN, RSI_NEUTRAL_MAX = 45.0, 55.0
 RETEST_MAX_BARS              = 6
 CHOP_ATR_PCTL                = 0.25
 
-# Supply/Demand
+# Supply/Demand usage
 ZONE_SD_ENABLED        = True
 ZONE_TOUCH_BPS         = 15.0
+DEMAND_TOUCH_BPS       = 15.0
 
-# Trend Riding
+# Trend Riding to opposite zone
 TREND_TARGET_ENABLED       = True
 TREND_TARGET_TOUCH_BPS     = 18.0
 TREND_TARGET_REQUIRE_REJ   = True
 TREND_TARGET_WICK_MIN      = 0.50
 
-# Demand Guard (بعد شراء من Demand يجب اختراق أعلى الصندوق خلال X شموع)
+# Demand Guard: after demand-buy must break above top in X bars
 DEMAND_PRIORITY_ENABLED   = True
-DEMAND_TOUCH_BPS          = 15.0
 DEMAND_BREAKOUT_WAIT_BARS = 6
 DEMAND_BREAKOUT_BPS       = 10.0
 
-# ===== Council Full-Consensus (بوابة تأكيد صارمة) =====
+# ===== Council Full-Consensus (strict gate) =====
 COUNCIL_FULL_CONSENSUS = True
 
+# RF (trend-follow) gate
 CONF_ADX_MIN          = 18.0
 CONF_EVX_RATIO_MIN    = 1.30
 CONF_EVX_REACT_MIN    = 1.10
 CONF_ATR_PCTL_MIN     = 0.20
-CONF_BODY_ATR_MIN     = 0.60          # جسم الشمعة/ATR
-CONF_ZONE_OFFSET_BPS  = 5.0           # مسافة أمان من حافة RF أو الصندوق
+CONF_BODY_ATR_MIN     = 0.60          # body/ATR for RF entries
+CONF_ZONE_OFFSET_BPS  = 5.0           # distance from edges (RF bands / zone)
+
+# Zones (bottom/top catching) gate — relaxed vs RF
+CONF_ATR_PCTL_MIN_ZONE = 0.10
+CONF_BODY_ATR_MIN_ZONE = 0.50         # body/ATR for zone entries (catch bottoms/tops)
 
 # Final chunk strict close threshold (contracts)
 FINAL_CHUNK_QTY = 0.2
@@ -164,7 +170,7 @@ compound_pnl = 0.0
 wait_for_next_signal_side = None
 last_adx_peak = None
 cond_ini = None              # Pine CondIni
-rf_fdir  = 0                 # اتجاه فلتر RF (1 up / -1 down / 0 flat)
+rf_fdir  = 0                 # 1 up / -1 down / 0 flat
 
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
@@ -270,12 +276,12 @@ def compute_indicators(df: pd.DataFrame):
         return {"rsi":None,"plus_di":None,"minus_di":None,"dx":None,"adx":None,"atr":None,"atr_pctl":None}
     c = df["close"].astype(float); h=df["high"].astype(float); l=df["low"].astype(float)
 
-    # RSI (Wilder RMA)
+    # RSI (RMA/Wilder)
     delta=c.diff(); up=delta.clip(lower=0.0); dn=(-delta).clip(lower=0.0)
     rma_up=_rma(up, RSI_LEN); rma_dn=_rma(dn, RSI_LEN).replace(0,1e-12)
     rs=rma_up/rma_dn; rsi=100-(100/(1+rs))
 
-    # ADX (Wilder RMA)
+    # ADX (RMA/Wilder)
     up_move=h.diff(); down_move=l.shift(1)-l
     plus_dm=up_move.where((up_move>down_move)&(up_move>0),0.0)
     minus_dm=down_move.where((down_move>up_move)&(down_move>0),0.0)
@@ -285,7 +291,7 @@ def compute_indicators(df: pd.DataFrame):
     dx=(100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0.0)
     adx=_rma(dx, ADX_LEN)
 
-    # ATR percentile (chop)
+    # ATR percentile (chop detector)
     atr_hist = _rma(tr, ATR_LEN)
     atr_pctl = None
     try:
@@ -296,7 +302,7 @@ def compute_indicators(df: pd.DataFrame):
     except Exception:
         atr_pctl = None
 
-    # track ADX peak
+    # track last adx peak
     try:
         cur_adx = float(adx.iloc[-1])
         if last_adx_peak is None or cur_adx > last_adx_peak:
@@ -315,8 +321,7 @@ def compute_indicators(df: pd.DataFrame):
 # =================== RANGE FILTER — Pine-exact (CLOSED candle) ===================
 def rf_signal_closed_pine(df: pd.DataFrame):
     """
-    Pine-exact لفلتر DonovanWall (B&S) مع CondIni واتجاه الفلتر.
-    نشتغل على الشمعة المغلقة (k=-2) لضمان التطابق.
+    Pine-exact — DonovanWall RF "B&S" logic, CLOSED candle only.
     """
     global cond_ini, rf_fdir
     need = RF_PERIOD + 3
@@ -387,42 +392,41 @@ def rf_signal_closed_pine(df: pd.DataFrame):
     }
 
 def bootstrap_cond_ini_from_history(df: pd.DataFrame):
-    """ابنِ CondIni واتجاه الفلتر من التاريخ المغلق حتى تتطابق إشارة Pine."""
+    """Init CondIni & rf_fdir from closed history to match Pine."""
     global cond_ini, rf_fdir
     try:
         if len(df) < RF_PERIOD + 3:
             cond_ini = 0 if cond_ini is None else cond_ini
-            rf_fdir = 0 if rf_fdir not in (1,-1,0) else rf_fdir
-            return
-        src = df[RF_SOURCE].astype(float)
-        def _ema(s, span): return s.ewm(span=span, adjust=False).mean()
-        def _rng_size(x, qty, per):
-            wper = (per * 2) - 1
-            avrng = _ema((x - x.shift(1)).abs(), per)
-            return _ema(avrng, wper) * qty
-        def _rng_filter(x, r):
-            rf = [float(x.iloc[0])]
-            for i in range(1, len(x)):
-                prev = rf[-1]; xi = float(x.iloc[i]); ri=float(r.iloc[i]); cur=prev
-                if xi - ri > prev: cur = xi - ri
-                if xi + ri < prev: cur = xi + ri
-                rf.append(cur)
-            return pd.Series(rf, index=x.index, dtype="float64")
-        r = _rng_size(src, RF_MULT, RF_PERIOD)
-        filt = _rng_filter(src, r)
+        else:
+            src = df[RF_SOURCE].astype(float)
+            def _ema(s, span): return s.ewm(span=span, adjust=False).mean()
+            def _rng_size(x, qty, per):
+                wper = (per * 2) - 1
+                avrng = _ema((x - x.shift(1)).abs(), per)
+                return _ema(avrng, wper) * qty
+            def _rng_filter(x, r):
+                rf = [float(x.iloc[0])]
+                for i in range(1, len(x)):
+                    prev = rf[-1]; xi=float(x.iloc[i]); ri=float(r.iloc[i]); cur=prev
+                    if xi - ri > prev: cur = xi - ri
+                    if xi + ri < prev: cur = xi + ri
+                    rf.append(cur)
+                return pd.Series(rf, index=x.index, dtype="float64")
+            r = _rng_size(src, RF_MULT, RF_PERIOD)
+            filt = _rng_filter(src, r)
 
-        ci = 0; rfdir = 0
-        for i in range(RF_PERIOD + 2, len(df)):
-            p_k   = float(src.iloc[i])
-            f_k   = float(filt.iloc[i])
-            f_km1 = float(filt.iloc[i-1])
-            if f_k>f_km1: rfdir=1
-            elif f_k<f_km1: rfdir=-1
-            longCond  = (p_k > f_k) and (rfdir==1)
-            shortCond = (p_k < f_k) and (rfdir==-1)
-            ci = 1 if longCond else (-1 if shortCond else ci)
-        cond_ini = ci
-        rf_fdir  = rfdir
+            ci = 0; rfdir = 0
+            for i in range(RF_PERIOD + 2, len(df)):
+                p_k   = float(src.iloc[i])
+                f_k   = float(filt.iloc[i])
+                f_km1 = float(filt.iloc[i-1])
+                if f_k>f_km1: rfdir=1
+                elif f_k<f_km1: rfdir=-1
+                longCond  = (p_k > f_k) and (rfdir==1)
+                shortCond = (p_k < f_k) and (rfdir==-1)
+                ci = 1 if longCond else (-1 if shortCond else ci)
+            cond_ini = ci
+            rf_fdir  = rfdir
         print(colored(f"🔧 CondIni bootstrapped → {cond_ini} | rf_fdir={rf_fdir}", "cyan"))
     except Exception as e:
         print(colored(f"⚠️ bootstrap CondIni error: {e}", "yellow"))
@@ -455,6 +459,46 @@ def _find_swings(df: pd.DataFrame, left:int=2, right:int=2):
         if all(l[i] <= l[j] for j in range(i-left, i+right+1)): pl[i] = l[i]
     return ph, pl
 
+def _pivot_lows_highs(df, left=2, right=2):
+    if len(df) < left+right+3: return [], []
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    pl_idx, ph_idx = [], []
+    for i in range(left, len(df)-right):
+        if all(l[i] <= l[j] for j in range(i-left, i+right+1)): pl_idx.append(i)
+        if all(h[i] >= h[j] for j in range(i-left, i+right+1)): ph_idx.append(i)
+    return pl_idx, ph_idx
+
+def _bottom_confirmed(df):
+    """Higher Low + BOS صاعد: قاع مؤكد لصفقات الشراء من الطلب."""
+    pl, ph = _pivot_lows_highs(df, 2, 2)
+    if len(pl) < 2 or len(ph) < 1: return False
+    L2, L1 = pl[-2], pl[-1]
+    if L1 <= L2: return False
+    low_L2 = float(df["low"].iloc[L2]); low_L1 = float(df["low"].iloc[L1])
+    if not (low_L1 > low_L2): return False  # HL
+    mids = [i for i in ph if L2 < i < L1]
+    if not mids: return False
+    Hm = max(mids, key=lambda i: df["high"].iloc[i])
+    bos_level = float(df["high"].iloc[Hm])
+    close_last = float(df["close"].iloc[-2])
+    return close_last > bos_level
+
+def _top_confirmed(df):
+    """Lower High + BOS هابط: قمة مؤكدة لصفقات البيع من العرض."""
+    pl, ph = _pivot_lows_highs(df, 2, 2)
+    if len(ph) < 2 or len(pl) < 1: return False
+    H2, H1 = ph[-2], ph[-1]
+    if H1 <= H2: return False
+    high_H2 = float(df["high"].iloc[H2]); high_H1 = float(df["high"].iloc[H1])
+    if not (high_H1 < high_H2): return False  # LH
+    mids = [i for i in pl if H2 < i < H1]
+    if not mids: return False
+    Lm = min(mids, key=lambda i: df["low"].iloc[i])
+    bos_level = float(df["low"].iloc[Lm])
+    close_last = float(df["close"].iloc[-2])
+    return close_last < bos_level
+
 def _nearest_level(px, levels, bps=LEVEL_NEAR_BPS):
     try:
         levels = [lv for lv in levels if lv is not None]
@@ -485,7 +529,7 @@ def detect_smc_levels(df: pd.DataFrame):
         eqh = _eq(ph, True)
         eql = _eq(pl, False)
 
-        # OB
+        # OB (as proxy zone)
         ob = None
         for i in range(len(d)-3, max(len(d)-50, 1), -1):
             o=float(d["open"].iloc[i]); c=float(d["close"].iloc[i])
@@ -497,7 +541,7 @@ def detect_smc_levels(df: pd.DataFrame):
                 ob={"side":side,"bot":min(o,c),"top":max(o,c),"time":int(d["time"].iloc[i])}
                 break
 
-        # FVG
+        # FVG (optional)
         fvg=None
         for i in range(len(d)-3, max(len(d)-30, 2), -1):
             prev_high = float(d["high"].iloc[i-1]); prev_low = float(d["low"].iloc[i-1])
@@ -507,7 +551,7 @@ def detect_smc_levels(df: pd.DataFrame):
             if curr_high < prev_low:
                 fvg={"type":"BEAR_FVG","bottom":curr_high,"top":prev_low}; break
 
-        # SDZ
+        # SDZ (recent swing candle body)
         sdz = None
         try:
             idxs = [i for i,v in enumerate(ph) if v is not None] + [i for i,v in enumerate(pl) if v is not None]
@@ -534,7 +578,7 @@ def explosion_signal(df: pd.DataFrame, ind: dict):
         strong = (ratio>=EVX_STRONG_RATIO and react>=EVX_BODY_ATR_MIN)
         return {"explosion":bool(strong),"dir":(1 if c>o else -1),"ratio":float(ratio), "react": float(react)}
     except Exception:
-        return {"explosion":False,"dir":0,"ratio":0.0,"react":0.0}
+        return {"explosion":False,"dir":0.0,"ratio":0.0,"react":0.0}
 
 # =============== FAKE/REAL BREAK + RETEST + TRAPS =================
 def near_level(px, lvl, bps=LEVEL_NEAR_BPS):
@@ -565,10 +609,7 @@ def detect_retest(df: pd.DataFrame, level: float, side: str):
     try:
         if level is None: return False
         closes = df["close"].astype(float).iloc[-(RETEST_MAX_BARS+1):-1].values
-        if side=="long":
-            return any(near_level(px, level) for px in closes)
-        else:
-            return any(near_level(px, level) for px in closes)
+        return any(near_level(px, level) for px in closes)
     except Exception:
         return False
 
@@ -632,65 +673,67 @@ def _away_from_edge(px, lo, hi, bps=CONF_ZONE_OFFSET_BPS):
 
 def _rf_bands_ok(info: dict):
     try:
-        return _away_from_edge(float(info["price"]), float(info["lo"]), float(info["hi"]), CONF_ZONE_OFFSET_BPS)
+        return _away_from_edge(float(info.get("price")), float(info.get("lo")), float(info.get("hi")), CONF_ZONE_OFFSET_BPS)
     except Exception:
         return True
 
-def entry_confirmation(side: str, df: pd.DataFrame, ind: dict, smc: dict, info: dict):
+def entry_confirmation(side: str, df: pd.DataFrame, ind: dict, smc: dict, info: dict, origin: str = "rf"):
     """
-    Full-Consensus Gate: لازم كل الركائز الأساسية تكون True.
-    يرجّع (ok:bool, pillars:list[(name,bool)])
+    Full-Consensus Gate:
+    - origin="rf": ADX/EVX + stricter ATR/body
+    - origin="zone": no ADX requirement (to catch bottoms/tops), relaxed ATR/body, but needs structure+reject
+    Returns (ok:bool, pillars:list[(name,bool)])
     """
     pillars=[]
 
-    # 0) سوق غير خامل
+    # 0) Market activity (ATR percentile)
     atrp = ind.get("atr_pctl")
-    ok_atr = (atrp is not None and float(atrp) >= CONF_ATR_PCTL_MIN)
+    atr_min = CONF_ATR_PCTL_MIN if origin=="rf" else CONF_ATR_PCTL_MIN_ZONE
+    ok_atr = (atrp is not None and float(atrp) >= atr_min)
     pillars.append(("atr_active", ok_atr))
     if not ok_atr: return False, pillars
 
-    # 1) زخم كافي (ADX أو EVX)
+    # 1) Momentum (RF requires, ZONE relaxed)
     adx = float(ind.get("adx") or 0.0)
     evx = explosion_signal(df, ind)
-    ok_mom = (adx >= CONF_ADX_MIN) or (evx.get("ratio",0.0) >= CONF_EVX_RATIO_MIN and evx.get("react",0.0) >= CONF_EVX_REACT_MIN)
+    if origin=="rf":
+        ok_mom = (adx >= CONF_ADX_MIN) or (evx.get("ratio",0.0) >= CONF_EVX_RATIO_MIN and evx.get("react",0.0) >= CONF_EVX_REACT_MIN)
+    else:
+        ok_mom = True
     pillars.append(("momentum", ok_mom))
     if not ok_mom: return False, pillars
 
-    # 2) شمعة بجسم كافٍ
+    # 2) Candle body vs ATR
     body, atr = _body_atr_last(df, ind)
-    ok_body = (atr > 0 and (body/atr) >= CONF_BODY_ATR_MIN)
+    body_min = CONF_BODY_ATR_MIN if origin=="rf" else CONF_BODY_ATR_MIN_ZONE
+    ok_body = (atr > 0 and (body/atr) >= body_min)
     pillars.append(("candle_body", ok_body))
     if not ok_body: return False, pillars
 
-    # 3) محاذاة RF
+    # 3) RF alignment
     ok_rf = (side=="buy" and rf_fdir==1) or (side=="sell" and rf_fdir==-1)
     pillars.append(("rf_align", ok_rf))
     if not ok_rf: return False, pillars
 
-    # 4) تحيّز RSI
+    # 4) RSI bias
     rsi = float(ind.get("rsi") or 50.0)
     ok_rsi = (side=="buy" and rsi>=50) or (side=="sell" and rsi<=50)
     pillars.append(("rsi_bias", ok_rsi))
     if not ok_rsi: return False, pillars
 
-    # 5) مسافة من حافة نطاق RF
+    # 5) Away from RF edges
     ok_edge = _rf_bands_ok(info)
     pillars.append(("away_from_rf_edge", ok_edge))
     if not ok_edge: return False, pillars
 
-    # 6) بنية/رفض مؤكد من الصناديق إن وُجدت
+    # 6) Structure confirmed (zones need this strongly)
     ok_struct = True
     try:
-        z = _get_demand_zone(smc) if side=="buy" else _get_supply_zone(smc)
-        if z:
-            zbot, ztop = float(z["bot"]), float(z["top"])
-            o1,h1,l1,c1 = [float(df[c].iloc[-3]) for c in ["open","high","low","close"]]
-            o2,h2,l2,c2 = [float(df[c].iloc[-2]) for c in ["open","high","low","close"]]
-            touched_prev = (_in_zone(l1, zbot, ztop) if side=="buy" else _in_zone(h1, zbot, ztop)) \
-                           or near_level(l1 if side=="buy" else h1, zbot, CONF_ZONE_OFFSET_BPS) \
-                           or near_level(l1 if side=="buy" else h1, ztop, CONF_ZONE_OFFSET_BPS)
-            reject_now   = (c2 > max(zbot,ztop)) if side=="buy" else (c2 < min(zbot,ztop))
-            ok_struct = touched_prev and reject_now and _away_from_edge(float(info["price"]), zbot, ztop, CONF_ZONE_OFFSET_BPS)
+        if origin=="zone":
+            if side=="buy":
+                ok_struct = _bottom_confirmed(df)
+            else:
+                ok_struct = _top_confirmed(df)
     except Exception:
         pass
     pillars.append(("structure_confirmed", ok_struct))
@@ -698,41 +741,39 @@ def entry_confirmation(side: str, df: pd.DataFrame, ind: dict, smc: dict, info: 
 
     return True, pillars
 
-def vote_pass(df, ind, smc, side: str):
-    """
-    Full-Consensus: نعتمد نفس بوابة التأكيد. لا نقاط مرجّحة؛ لازم الكل OK.
-    يرجّع (ok, score, votes) — score = عدد الركائز المجتازة لشفافية اللوج.
-    """
-    if not COUNCIL_FULL_CONSENSUS:
-        return True, 0.0, [("legacy_ok",1.0,"—")]
+def vote_pass(df, ind, smc, side: str, origin: str = "rf"):
     ok, pillars = entry_confirmation(side, df, ind, smc, {
         "price": float(df["close"].iloc[-2]),
         "hi": float(df["high"].iloc[-2]),
         "lo": float(df["low"].iloc[-2])
-    })
+    }, origin=origin)
     votes=[(name, 1.0 if passed else 0.0, "pillar") for (name, passed) in pillars]
     return ok, float(sum(1 for _,p,_ in votes if p>0)), votes
 
 # =================== ENTRY SIGNALS (Zones) ===================
 def demand_buy_signal(df: pd.DataFrame, smc: dict):
-    if not (ZONE_SD_ENABLED or DEMAND_PRIORITY_ENABLED) or len(df) < 23: return None
+    """Buy from demand only with two-bar reject + bottom confirmed (HL+BOS)."""
+    if not (ZONE_SD_ENABLED or DEMAND_PRIORITY_ENABLED) or len(df) < 30: return None
     try:
         z=_get_demand_zone(smc)
         if not z: return None
         zbot, ztop = _zone_bounds(z)
-        # رفض مؤكد: الشمعة السابقة لمست، الحالية أغلقت فوق
+        # two-bar reject
         h1,l1 = float(df["high"].iloc[-3]), float(df["low"].iloc[-3])
         c2    = float(df["close"].iloc[-2])
         touched_prev = _in_zone(l1, zbot, ztop) or near_level(l1,zbot,DEMAND_TOUCH_BPS) or near_level(l1,ztop,DEMAND_TOUCH_BPS)
         reject_now   = c2 > max(zbot, ztop)
-        if touched_prev and reject_now:
-            return {"signal":"buy","why":f"demand_touch_reject z=[{zbot:.3f},{ztop:.3f}]","top":max(zbot,ztop)}
+        # structure bottom
+        bottom_ok = _bottom_confirmed(df)
+        if touched_prev and reject_now and bottom_ok:
+            return {"signal":"buy","why":f"demand_touch_reject + bottom_confirmed z=[{zbot:.3f},{ztop:.3f}]","top":max(zbot,ztop)}
     except Exception:
         pass
     return None
 
 def supply_sell_signal(df: pd.DataFrame, smc: dict):
-    if not ZONE_SD_ENABLED or len(df) < 23: return None
+    """Sell from supply only with two-bar reject + top confirmed (LH+BOS)."""
+    if not ZONE_SD_ENABLED or len(df) < 30: return None
     try:
         z=_get_supply_zone(smc)
         if not z: return None
@@ -741,10 +782,30 @@ def supply_sell_signal(df: pd.DataFrame, smc: dict):
         c2    = float(df["close"].iloc[-2])
         touched_prev = _in_zone(h1, zbot, ztop) or near_level(h1,zbot,ZONE_TOUCH_BPS) or near_level(h1,ztop,ZONE_TOUCH_BPS)
         reject_now   = c2 < min(zbot, ztop)
-        if touched_prev and reject_now:
-            return {"signal":"sell","why":f"supply_touch_reject z=[{zbot:.3f},{ztop:.3f}]"}
+        top_ok = _top_confirmed(df)
+        if touched_prev and reject_now and top_ok:
+            return {"signal":"sell","why":f"supply_touch_reject + top_confirmed z=[{zbot:.3f},{ztop:.3f}]"}
     except Exception:
         pass
+    return None
+
+# Continuations: ride after break
+def supply_breakout_buy_signal(df: pd.DataFrame, smc: dict):
+    z = _get_supply_zone(smc)
+    if not z or len(df) < 4: return None
+    zbot, ztop = _zone_bounds(z); top = max(zbot, ztop)
+    c1 = float(df["close"].iloc[-3]); c2 = float(df["close"].iloc[-2])
+    if c1 > top and c2 > top:  # two closes above supply
+        return {"signal":"buy", "why":f"supply_breakout_buy top={top:.3f}"}
+    return None
+
+def demand_breakdown_sell_signal(df: pd.DataFrame, smc: dict):
+    z = _get_demand_zone(smc)
+    if not z or len(df) < 4: return None
+    zbot, ztop = _zone_bounds(z); bot = min(zbot, ztop)
+    c1 = float(df["close"].iloc[-3]); c2 = float(df["close"].iloc[-2])
+    if c1 < bot and c2 < bot:  # two closes below demand
+        return {"signal":"sell", "why":f"demand_breakdown_sell bot={bot:.3f}"}
     return None
 
 # =================== COUNCIL DECISION (EXIT MGMT) ===================
@@ -752,7 +813,7 @@ def council_assess(df, ind, info, smc, cache):
     votes = []
     price = info.get("price")
 
-    # قرب مستويات + شموع + EVX + تبريد زخم + كسر وهمي + Chop
+    # 1) near structure
     near_any = False
     try:
         lvls = []
@@ -771,10 +832,12 @@ def council_assess(df, ind, info, smc, cache):
     except Exception:
         pass
 
+    # 2) candle
     cndl = detect_candle(df)
     if cndl["pattern"] in ("SHOOTING","HAMMER") or (cndl["pattern"]=="DOJI" and near_any):
         votes.append(f"candle_reject:{cndl['pattern']}")
 
+    # 3) EVX
     evx = explosion_signal(df, ind)
     if evx["explosion"]:
         votes.append("evx_strong")
@@ -782,6 +845,7 @@ def council_assess(df, ind, info, smc, cache):
         if evx["ratio"] <= EVX_COOL_OFF_RATIO:
             votes.append("evx_cool")
 
+    # 4) momentum cool-off & RSI neutral
     try:
         adx = float(ind.get("adx") or 0.0); rsi=float(ind.get("rsi") or 50.0)
         if last_adx_peak is not None and (last_adx_peak - adx) >= ADX_COOL_OFF_DROP:
@@ -791,15 +855,16 @@ def council_assess(df, ind, info, smc, cache):
     except Exception:
         pass
 
+    # 5) fake-break / retest
     fk = detect_fake_break(df, smc)
     if fk["fake_break"]:
         votes.append(f"fake_break:{fk['side']}")
-
     side = STATE.get("side")
     l_for_retest = smc.get("eqh") if side=="long" else smc.get("eql")
     if detect_retest(df, l_for_retest, "long" if side=="long" else "short"):
         votes.append("retest_touched")
 
+    # 6) chop near level
     atr_pctl = ind.get("atr_pctl")
     if atr_pctl is not None and atr_pctl <= CHOP_ATR_PCTL and near_any and cndl["pattern"] in ("DOJI","SHOOTING","HAMMER"):
         votes.append("chop_near_level")
@@ -907,7 +972,6 @@ def _reset_after_close(reason, prev_side=None):
         "breakeven": None, "council": {"votes":0,"reasons":[]},
         "demand_guard": None, "trend_plan": None
     })
-    # انتظر الإشارة المعاكسة من RF قبل دخول جديد
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
     else: wait_for_next_signal_side = None
@@ -962,11 +1026,13 @@ def _trend_plan_should_close(df: pd.DataFrame, side: str, smc: dict):
 # =================== COUNCIL OVERRIDES (Zones) + CONSENSUS ===================
 def council_override_entries(df, ind, info, smc):
     """
-    الأولوية للصناديق، لكن الدخول/العكس لا يتم إلا بعد إجماع المجلس (بوابة التأكيد).
+    Priority to zones. Any entry requires consensus:
+    - origin="zone" for zone-based entries (no ADX requirement inside gate)
     """
+    # SELL from supply (reject + top confirmed)
     zsell=supply_sell_signal(df, smc)
     if zsell:
-        ok_vote, score, vt = vote_pass(df, ind, smc, "sell")
+        ok_vote, score, vt = vote_pass(df, ind, smc, "sell", origin="zone")
         print(colored(f"🗳️ SELL consensus={ok_vote} pillars={[n for (n,_,_) in vt]}", "magenta"))
         if ok_vote:
             if STATE["open"] and STATE["side"]=="long":
@@ -977,9 +1043,10 @@ def council_override_entries(df, ind, info, smc):
                     _arm_trend_plan_after_open("short", smc)
                     return True
 
+    # BUY from demand (reject + bottom confirmed)
     zbuy=demand_buy_signal(df, smc)
     if zbuy:
-        ok_vote, score, vt = vote_pass(df, ind, smc, "buy")
+        ok_vote, score, vt = vote_pass(df, ind, smc, "buy", origin="zone")
         print(colored(f"🗳️ BUY consensus={ok_vote} pillars={[n for (n,_,_) in vt]}", "magenta"))
         if ok_vote:
             if STATE["open"] and STATE["side"]=="short":
@@ -990,6 +1057,35 @@ def council_override_entries(df, ind, info, smc):
                     STATE["demand_guard"]={"top":float(zbuy["top"]), "start_bars":0, "max_wait":DEMAND_BREAKOUT_WAIT_BARS}
                     _arm_trend_plan_after_open("long", smc)
                     return True
+
+    # BUY continuation after supply breakout
+    br_buy = supply_breakout_buy_signal(df, smc)
+    if br_buy:
+        ok_vote, score, vt = vote_pass(df, ind, smc, "buy", origin="zone")
+        print(colored(f"🗳️ BUY-CONTINUATION consensus={ok_vote} pillars={[n for (n,_,_) in vt]}", "magenta"))
+        if ok_vote:
+            if STATE["open"] and STATE["side"]=="short":
+                close_market_strict("COUNCIL_SUPPLY_BREAKOUT_BUY")
+            if not STATE["open"]:
+                qty = compute_size(balance_usdt(), info["price"])
+                if qty>0 and open_market("buy", qty, info["price"]):
+                    _arm_trend_plan_after_open("long", smc)
+                    return True
+
+    # SELL continuation after demand breakdown
+    br_sell = demand_breakdown_sell_signal(df, smc)
+    if br_sell:
+        ok_vote, score, vt = vote_pass(df, ind, smc, "sell", origin="zone")
+        print(colored(f"🗳️ SELL-CONTINUATION consensus={ok_vote} pillars={[n for (n,_,_) in vt]}", "magenta"))
+        if ok_vote:
+            if STATE["open"] and STATE["side"]=="long":
+                close_market_strict("COUNCIL_DEMAND_BREAKDOWN_SELL")
+            if not STATE["open"]:
+                qty = compute_size(balance_usdt(), info["price"])
+                if qty>0 and open_market("sell", qty, info["price"]):
+                    _arm_trend_plan_after_open("short", smc)
+                    return True
+
     return False
 
 # =================== MANAGEMENT (after entry) ===================
@@ -1001,7 +1097,7 @@ def manage_after_entry(df, ind, info, smc):
     if rr > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = rr
 
-    # Demand Guard: اختراق أعلى صندوق الطلب خلال max_wait وإلا إغلاق صارم
+    # Demand Guard
     try:
         guard=STATE.get("demand_guard")
         if guard and side=="long":
@@ -1085,32 +1181,32 @@ def trade_loop():
             px  = price_now()
             df  = fetch_ohlcv()
 
-            # Bootstrap CondIni من التاريخ المغلق
+            # Bootstrap CondIni
             if cond_ini is None:
                 df_closed_init = df.iloc[:-1] if len(df) >= 2 else df.copy()
                 bootstrap_cond_ini_from_history(df_closed_init)
 
-            # RF Pine-exact على الشمعة المغلقة
+            # RF (closed)
             info = rf_signal_closed_pine(df)
             ind  = compute_indicators(df)
 
-            # SMC على تاريخ مغلق فقط
+            # SMC on closed history only
             df_closed = df.iloc[:-1] if len(df)>=2 else df.copy()
             smc = detect_smc_levels(df_closed)
 
-            # تحديث PnL
+            # Update PnL
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
 
-            # أولوية: صناديق مع إجماع
+            # Council priority: zones (origin="zone")
             if council_override_entries(df, ind, {"price": px or info["price"], **info}, smc):
                 pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, smc, "council_override", df)
                 loop_i += 1; time.sleep(BASE_SLEEP); continue
 
-            # إدارة ما بعد الدخول
+            # Manage after entry
             manage_after_entry(df, ind, {"price": px or info["price"], **info}, smc)
 
-            # ENTRY: RF CLOSED ONLY — gated by Full-Consensus + انتظار الإشارة المعاكسة بعد الإغلاق
+            # ENTRY: RF CLOSED ONLY — gated by Consensus (origin="rf") + wait opposite after close
             reason=None
             sig = "buy" if info["long"] else ("sell" if info["short"] else None)
             if (not STATE["open"]) and sig:
@@ -1118,7 +1214,7 @@ def trade_loop():
                     reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
                 else:
                     side_req = "buy" if sig=="buy" else "sell"
-                    ok_vote, score, vt = vote_pass(df, ind, smc, side_req)
+                    ok_vote, score, vt = vote_pass(df, ind, smc, side_req, origin="rf")
                     print(colored(f"🗳️ RF {side_req.upper()} consensus={ok_vote} pillars={[n for (n,_,_) in vt]}", "magenta"))
                     if ok_vote:
                         qty = compute_size(bal, px or info["price"])
@@ -1130,7 +1226,7 @@ def trade_loop():
 
             pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, smc, reason, df)
 
-            # عداد البارات المفتوحة
+            # Count open bars
             if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]) and STATE["open"]:
                 STATE["bars"] += 1
 
@@ -1147,7 +1243,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF-FUSION (Pine-closed) — {SYMBOL} {INTERVAL} — {mode} — Full-Consensus Council ✓ — TrendRide ✓ — FinalChunk={FINAL_CHUNK_QTY}"
+    return f"✅ RF-FUSION (Pine-closed) — {SYMBOL} {INTERVAL} — {mode} — Council Full-Consensus ✓ — Bottom/Top Confirmed ✓ — TrendRide ✓"
 
 @app.route("/metrics")
 def metrics():
@@ -1186,7 +1282,7 @@ def keepalive_loop():
 if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ENTRY=RF_CLOSED_ONLY (Pine-exact)", "yellow"))
-    print(colored("COUNCIL Full-Consensus ✓  ZONE Priority ✓  TREND Ride ✓  DEMAND Guard ✓", "yellow"))
+    print(colored("COUNCIL Full-Consensus ✓  TRUE Bottom/Top ✓  ZONE Priority ✓  TREND Ride ✓  DEMAND Guard ✓", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))

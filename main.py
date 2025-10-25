@@ -1,42 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-BYBIT — RF FUSION (TV-like RF entries) + Smart Council Priority (Zones + Trend Riding)
-• Exchange: Bybit USDT Perps via CCXT
-• Entry: Range Filter (TradingView-like), supports LIVE-candle flip (TV-like) or CLOSED-candle (Pine-exact)
-• Council Priority:
-    - Opens/Reverses on strong Supply/Demand zone rejections (strict-close first if opposite).
-    - Demand Priority: open BUY at green box; if no breakout soon → strict close.
-    - Trend Riding: hold positions intelligently until price reaches the opposite box (Long→Supply, Short→Demand),
-                    then close on touch+rejection (smart exit).
-• NO partial take-profits, NO ATR trailing. One-shot strict close at council logic.
-• Cumulative PnL tracking + strict close (reduceOnly) + Flask /metrics /health
-"""
-
-import os, time, math, random, signal, sys, traceback, logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime
-import pandas as pd
-import numpy as np
-import ccxt
-from flask import Flask, jsonify
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
-
-try:
-    from termcolor import colored
-except Exception:
-    def colored(t,*a,**k): return t
-
-# =================== ENV / MODE ===================
-API_KEY = os.getenv("BYBIT_API_KEY", "") or os.getenv("BINGX_API_KEY","")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "") or os.getenv("BINGX_API_SECRET","")
-MODE_LIVE = bool(API_KEY and API_SECRET)
-
-SELF_URL = os.getenv("SELF_URL", "")
-PORT = int(os.getenv("PORT", 5000))
-
-# =================== FIXED CONFIG ===================
-SYMBOL     = "SOL/USDT:USDT"   # Bybit Perp
-INTERVAL   = "15m"
 
 LEVERAGE   = 10
 RISK_ALLOC = 0.60

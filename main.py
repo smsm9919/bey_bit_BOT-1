@@ -131,6 +131,7 @@ compound_pnl = 0.0
 wait_for_next_signal_side = None   # بعد الإغلاق: انتظر إشارة RF المعاكسة (يُحدّث عند الإغلاق)
 last_adx_peak = None               # تتبع قمة ADX الأخيرة لأغراض التبريد
 cond_ini = None                    # نبوّتستراب من التاريخ لكي يطابق Pine
+rf_fdir = 0                        # ★ اتجاه الفلتر (Pine-like stateful): +1 / -1، ويُحافظ عليه عند التساوي
 
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
@@ -273,9 +274,10 @@ def rf_signal_closed_pine(df: pd.DataFrame):
     Pine-exact of 'Range Filter - B&S Signals' (DonovanWall) with CondIni logic:
     - Work on last CLOSED candle (k=-2 vs -3).
     - longSignal / shortSignal identical to Pine's longCondition/shortCondition.
+    - fdir is stateful like Pine: retains last direction when filt==filt[1].
     - No extra hysteresis; follows rng_size/rng_filt + fdir rules exactly.
     """
-    global cond_ini
+    global cond_ini, rf_fdir
     need = RF_PERIOD + 3
     n = len(df)
     if n < need:
@@ -318,11 +320,17 @@ def rf_signal_closed_pine(df: pd.DataFrame):
     f_k   = float(filt.iloc[k])
     f_km1 = float(filt.iloc[km1])
 
-    # direction fdir (upward/downward)
-    upward   = 1 if f_k > f_km1 else 0
-    downward = 1 if f_k < f_km1 else 0
+    # ★ Pine-like stateful fdir (retain on equality)
+    if f_k > f_km1:
+        rf_fdir = 1
+    elif f_k < f_km1:
+        rf_fdir = -1
+    # else: keep previous rf_fdir as-is
 
-    # Pine long/short prelim conditions
+    upward   = 1 if rf_fdir == 1 else 0
+    downward = 1 if rf_fdir == -1 else 0
+
+    # Pine long/short prelim conditions (like original)
     longCond  = (p_k > f_k) and (upward > 0)
     shortCond = (p_k < f_k) and (downward > 0)
 
@@ -348,11 +356,12 @@ def rf_signal_closed_pine(df: pd.DataFrame):
 
 # -------- Bootstrap CondIni from closed history (Pine-exact) ----------
 def bootstrap_cond_ini_from_history(df: pd.DataFrame):
-    """يبني CondIni من الشموع المغلقة حتى ما قبل الأخيرة ليطابق Pine."""
-    global cond_ini
+    """يبني CondIni (والآن rf_fdir) من الشموع المغلقة حتى ما قبل الأخيرة ليطابق Pine."""
+    global cond_ini, rf_fdir
     try:
         if len(df) < RF_PERIOD + 3:
             cond_ini = 0 if cond_ini is None else cond_ini
+            rf_fdir = rf_fdir if rf_fdir in (1,-1,0) else 0
             return
         src = df[RF_SOURCE].astype(float)
 
@@ -375,23 +384,33 @@ def bootstrap_cond_ini_from_history(df: pd.DataFrame):
         filt = _rng_filter(src, r)
 
         ci = 0
+        rf_fdir_boot = 0
         # نمشي من أول نقطة متاحة حتى ما قبل آخر بار (كلها شموع مغلقة)
-        for i in range(RF_PERIOD + 2, len(df) - 0):  # آخر بار في df_closed مغلق
+        for i in range(RF_PERIOD + 2, len(df)):
             if i-1 < 0: continue
             p_k   = float(src.iloc[i])
             f_k   = float(filt.iloc[i])
             f_km1 = float(filt.iloc[i-1])
-            upward   = 1 if f_k > f_km1 else 0
-            downward = 1 if f_k < f_km1 else 0
+
+            if f_k > f_km1:
+                rf_fdir_boot = 1
+            elif f_k < f_km1:
+                rf_fdir_boot = -1
+            # else: احتفظ بالحالة
+
+            upward   = 1 if rf_fdir_boot == 1 else 0
+            downward = 1 if rf_fdir_boot == -1 else 0
             longCond  = (p_k > f_k) and (upward > 0)
             shortCond = (p_k < f_k) and (downward > 0)
             ci = 1 if longCond else (-1 if shortCond else ci)
 
         cond_ini = ci
-        print(colored(f"🔧 CondIni bootstrapped from history → {cond_ini}", "cyan"))
+        rf_fdir  = rf_fdir_boot
+        print(colored(f"🔧 CondIni bootstrapped from history → {cond_ini} | rf_fdir={rf_fdir}", "cyan"))
     except Exception as e:
         print(colored(f"⚠️ bootstrap CondIni error: {e}", "yellow"))
         if cond_ini is None: cond_ini = 0
+        if rf_fdir not in (1,-1,0): rf_fdir = 0
 
 # =================== PATTERNS / SMC / SDZ / EVX ===================
 def detect_candle(df: pd.DataFrame):

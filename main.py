@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-BYBIT — RF-CLOSE FUSION (Entry by RF; supports live-bar like TV)
+BYBIT — RF-CLOSE FUSION (Entry by RF; supports live-bar like TV) + Council Priority Zone-Reject
 • Exchange: Bybit USDT Perps via CCXT
 • Entry: Range Filter (TradingView-like), supports LIVE-candle flip (TV-like) or CLOSED-candle (Pine-exact)
-• Council (after entry only): SMC (EQH/EQL + OB + FVG + SDZ) + Candles + EVX + Momentum + Fake/Real Break + Retest + Liquidity traps
+• Council (after entry only) + Council Priority Override: SMC (EQH/EQL + OB + FVG + SDZ) + Candles + EVX + Momentum + Fake/Real Break + Retest + Liquidity traps + Zone-Reject override
 • NO partial take-profits, NO ATR trailing. One-shot strict close at 'max-logic' profit (council-confirmed)
 • Cumulative PnL tracking + strict close (reduceOnly) + final-chunk guard (tiny residual) + Flask /metrics /health
 """
@@ -63,6 +63,14 @@ ADX_COOL_OFF_DROP            = 2.0
 RSI_NEUTRAL_MIN, RSI_NEUTRAL_MAX = 45.0, 55.0
 RETEST_MAX_BARS              = 6
 CHOP_ATR_PCTL                = 0.25
+
+# ====== Supply/Demand Reversal (Council Priority Override) ======
+# هذه هي الإضافة الوحيدة المؤثرة على القرار (بدون المساس بمنطق RF)
+ZONE_SD_ENABLED        = True      # تفعيل أولوية المجلس عند رفض الصناديق
+ZONE_TOUCH_BPS         = 15.0      # مدى القرب من حدود الصندوق (bps)
+ZONE_WICK_FRAC_MIN     = 0.55      # طول الذيل كنسبة من مدى الشمعة (قوة الرفض)
+ZONE_VOL_MULT_MIN      = 1.10      # تضخم الحجم مقابل متوسط 20 شمعة (تأكيد)
+ZONE_RETEST_MAX_BARS   = 6         # نافذة إعادة الاختبار
 
 # Pacing
 BASE_SLEEP   = 5
@@ -608,6 +616,115 @@ def detect_trap(df: pd.DataFrame, smc: dict):
         pass
     return None
 
+# =================== ZONE-REJECT (Council Priority Override) ===================
+def _zone_bounds(z):
+    if not z: return None, None
+    return float(z.get("bot")), float(z.get("top"))
+
+def _in_zone(px, zbot, ztop):
+    a, b = min(zbot, ztop), max(zbot, ztop)
+    return a <= px <= b
+
+def demand_buy_signal(df: pd.DataFrame, smc: dict):
+    """ BUY عند رفض قوي من صندوق Demand/OB bull — لمس/دخول الصندوق ثم إغلاق فوقه + ذيل سفلي طويل. يدعم إعادة الاختبار. """
+    if not ZONE_SD_ENABLED or len(df) < 22: return None
+    try:
+        o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
+        l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
+        rng=max(h-l,1e-12)
+        lower_wick = (min(o,c)-l)/rng
+        v=float(df["volume"].iloc[-2]); vma=float(df["volume"].iloc[-22:-2].astype(float).mean() or 1e-9)
+        vol_mult = v/max(vma,1e-9)
+
+        z = smc.get("sdz") if (smc.get("sdz") or {}).get("side")=="demand" else (smc.get("ob") if (smc.get("ob") or {}).get("side")=="bull" else None)
+        if not z: return None
+        zbot, ztop = _zone_bounds(z)
+
+        near_low  = near_level(l, zbot, ZONE_TOUCH_BPS) or near_level(l, ztop, ZONE_TOUCH_BPS) or _in_zone(l, zbot, ztop)
+        first_touch_reject = near_low and (c > max(zbot,ztop)) and (lower_wick >= ZONE_WICK_FRAC_MIN) and (vol_mult >= ZONE_VOL_MULT_MIN)
+
+        closes = df["close"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
+        lows   = df["low"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
+        retest_touch  = any(near_level(x, zbot, ZONE_TOUCH_BPS) or near_level(x, ztop, ZONE_TOUCH_BPS) or _in_zone(x, zbot, ztop) for x in lows)
+        all_closes_above = all(cc > max(zbot,ztop) for cc in closes) if len(closes)>0 else False
+        this_bar_reject  = near_low and (c > max(zbot,ztop)) and (lower_wick >= ZONE_WICK_FRAC_MIN)
+
+        if first_touch_reject:
+            return {"signal":"buy","why":f"demand_first_reject wick={lower_wick:.2f} volx={vol_mult:.2f} z=[{zbot:.3f},{ztop:.3f}]"}
+        if retest_touch and all_closes_above and this_bar_reject:
+            return {"signal":"buy","why":f"demand_retest_reject wick={lower_wick:.2f} z=[{zbot:.3f},{ztop:.3f}] within {ZONE_RETEST_MAX_BARS} bars"}
+    except Exception:
+        pass
+    return None
+
+def supply_sell_signal(df: pd.DataFrame, smc: dict):
+    """ SELL عند رفض قوي من صندوق Supply/OB bear — لمس/دخول الصندوق ثم إغلاق تحته + ذيل علوي طويل. يدعم إعادة الاختبار. """
+    if not ZONE_SD_ENABLED or len(df) < 22: return None
+    try:
+        o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
+        l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
+        rng=max(h-l,1e-12)
+        upper_wick = (h-max(o,c))/rng
+        v=float(df["volume"].iloc[-2]); vma=float(df["volume"].iloc[-22:-2].astype(float).mean() or 1e-9)
+        vol_mult = v/max(vma,1e-9)
+
+        z = smc.get("sdz") if (smc.get("sdz") or {}).get("side")=="supply" else (smc.get("ob") if (smc.get("ob") or {}).get("side")=="bear" else None)
+        if not z: return None
+        zbot, ztop = _zone_bounds(z)
+
+        near_high = near_level(h, zbot, ZONE_TOUCH_BPS) or near_level(h, ztop, ZONE_TOUCH_BPS) or _in_zone(h, zbot, ztop)
+        first_touch_reject = near_high and (c < min(zbot,ztop)) and (upper_wick >= ZONE_WICK_FRAC_MIN) and (vol_mult >= ZONE_VOL_MULT_MIN)
+
+        closes = df["close"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
+        highs  = df["high"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
+        retest_touch  = any(near_level(x, zbot, ZONE_TOUCH_BPS) or near_level(x, ztop, ZONE_TOUCH_BPS) or _in_zone(x, zbot, ztop) for x in highs)
+        all_closes_below = all(cc < min(zbot,ztop) for cc in closes) if len(closes)>0 else False
+        this_bar_reject  = near_high and (c < min(zbot,ztop)) and (upper_wick >= ZONE_WICK_FRAC_MIN)
+
+        if first_touch_reject:
+            return {"signal":"sell","why":f"supply_first_reject wick={upper_wick:.2f} volx={vol_mult:.2f} z=[{zbot:.3f},{ztop:.3f}]"}
+        if retest_touch and all_closes_below and this_bar_reject:
+            return {"signal":"sell","why":f"supply_retest_reject wick={upper_wick:.2f} z=[{zbot:.3f},{ztop:.3f}] within {ZONE_RETEST_MAX_BARS} bars"}
+    except Exception:
+        pass
+    return None
+
+def council_override_entries(df, ind, info, smc):
+    """
+    أولوية المجلس: افتح/اعكس عند رفض قوي من Supply/Demand.
+    - لو في صفقة مفتوحة عكس الإشارة → إغلاق صارم ثم فتح الصفقة الجديدة.
+    - لو فلات → فتح فوري.
+    - لو نفس اتجاه المركز الحالي → تجاهُل (لا نضاعف).
+    يرجع True إذا اتخذ إجراء (لتجاوز دخول RF في هذه الدورة).
+    """
+    zbuy  = demand_buy_signal(df, smc)
+    zsell = supply_sell_signal(df, smc)
+    zsig  = zsell or zbuy
+    if not zsig:
+        return False
+
+    want_side = "buy" if zsig["signal"]=="buy" else "sell"
+    cur_open  = STATE["open"]
+    cur_side  = STATE.get("side")
+
+    # عكس مع إغلاق صارم
+    if cur_open and ((cur_side=="long" and want_side=="sell") or (cur_side=="short" and want_side=="buy")):
+        logging.info(f"COUNCIL_OVERRIDE reverse(strict) → {zsig}")
+        close_market_strict(f"COUNCIL_ZONE_{zsig['signal'].upper()}")
+        qty = compute_size(balance_usdt(), info["price"])
+        if qty>0: open_market(want_side, qty, info["price"])
+        return True
+
+    # فتح مباشر لو فلات
+    if not cur_open:
+        qty = compute_size(balance_usdt(), info["price"])
+        if qty>0:
+            logging.info(f"COUNCIL_OVERRIDE open → {zsig}")
+            open_market(want_side, qty, info["price"])
+            return True
+
+    return False
+
 # =================== COUNCIL DECISION ===================
 def council_assess(df, ind, info, smc, cache):
     votes = []
@@ -848,6 +965,15 @@ def pretty_snapshot(bal, info, ind, smc, reason=None, df=None):
     print(f"   🏗️ SMC: EQH={fmt(smc.get('eqh'))}  EQL={fmt(smc.get('eql'))}  OB={smc.get('ob')}  FVG={smc.get('fvg')}  SDZ={smc.get('sdz')}")
     print(f"   ⏱️ closes_in ≈ {left_s}s")
 
+    # توضيح إشارة الصناديق (اختياري للمتابعة)
+    try:
+        _zbuy = demand_buy_signal(df, smc)
+        _zsel = supply_sell_signal(df, smc)
+        if _zbuy: print(colored(f"   🧱 Zone Override: BUY ({_zbuy['why']})", "magenta"))
+        if _zsel: print(colored(f"   🧱 Zone Override: SELL ({_zsel['why']})", "magenta"))
+    except Exception:
+        pass
+
     print("\n🧭 POSITION")
     bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
     print(colored(f"   {bal_line}", "yellow"))
@@ -886,7 +1012,14 @@ def trade_loop():
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
 
-            # إدارة المجلس
+            # أولوية المجلس: لو نفّذ إجراء (فتح/انعكاس بإغلاق صارم) بسبب رفض الصناديق — نتخطّى دخول RF هذه الدورة
+            if council_override_entries(df, ind, {"price": px or info["price"], **info}, smc):
+                pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, smc, "council_override", df)
+                loop_i += 1
+                time.sleep(BASE_SLEEP)
+                continue
+
+            # إدارة المجلس (ما بعد الدخول)
             manage_after_entry(df, ind, {"price": px or info["price"], **info}, smc)
 
             # ENTRY: زي TV — لو في إشارة افتح فورًا (بدون انتظار الإشارة المعاكسة)
@@ -921,7 +1054,7 @@ app = Flask(__name__)
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
     mode_entry = "RF_LIVE (TV-like)" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY (Pine-exact)"
-    return f"✅ RF FUSION — {SYMBOL} {INTERVAL} — {mode} — Entry: {mode_entry} — Council strict-exit — FinalChunk={FINAL_CHUNK_QTY}"
+    return f"✅ RF FUSION — {SYMBOL} {INTERVAL} — {mode} — Entry: {mode_entry} — Council strict-exit + ZoneOverride — FinalChunk={FINAL_CHUNK_QTY}"
 
 @app.route("/metrics")
 def metrics():
@@ -930,7 +1063,7 @@ def metrics():
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "RF_LIVE" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY_PINE",
-        "waiting_for": None  # لم نعد نستخدمه كحارس دخول
+        "zone_override": ZONE_SD_ENABLED
     })
 
 @app.route("/health")
@@ -940,7 +1073,8 @@ def health():
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "RF_LIVE" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY_PINE",
-        "council_votes": STATE.get("council",{}).get("votes",0)
+        "council_votes": STATE.get("council",{}).get("votes",0),
+        "zone_override": ZONE_SD_ENABLED
     }), 200
 
 def keepalive_loop():
@@ -960,7 +1094,7 @@ def keepalive_loop():
 if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ENTRY={'RF_LIVE (TV-like)' if not RF_CLOSED_ONLY else 'RF_CLOSED_ONLY (Pine-exact)'}", "yellow"))
-    print(colored(f"NO TPs/NO TRAIL • STRICT EXIT by COUNCIL • FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
+    print(colored(f"NO TPs/NO TRAIL • STRICT EXIT by COUNCIL • ZoneOverride ENABLED={ZONE_SD_ENABLED} • FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))

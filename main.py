@@ -102,10 +102,27 @@ def load_market_specs():
     global MARKET, AMT_PREC, LOT_STEP, LOT_MIN
     try:
         ex.load_markets()
-        MARKET = ex.markets.get(SYMBOL, {})
+        MARKET = ex.markets.get(SYMBOL, {}) or {}
         AMT_PREC = int((MARKET.get("precision", {}) or {}).get("amount", 0) or 0)
-        LOT_STEP = (MARKET.get("limits", {}) or {}).get("amount", {}).get("step", None)
-        LOT_MIN  = (MARKET.get("limits", {}) or {}).get("amount", {}).get("min",  None)
+        lims = (MARKET.get("limits", {}) or {}).get("amount", {}) or {}
+        LOT_STEP = lims.get("step", None)
+        LOT_MIN  = lims.get("min",  None)
+
+        # ★ إصلاح Bybit: أحيانًا step لا يظهر في limits، بل في info.lotSizeFilter.qtyStep
+        if LOT_STEP is None:
+            info = MARKET.get("info", {}) or {}
+            lotf = info.get("lotSizeFilter") or info.get("lotSizeFilterV2") or {}
+            qstep = lotf.get("qtyStep") or lotf.get("stepSize")
+            if qstep is not None:
+                LOT_STEP = float(qstep)
+            elif LOT_MIN is not None:
+                # fallback آمن: لو الحد الأدنى أقل من 1 فاعتبره خطوة دنيا
+                try:
+                    if float(LOT_MIN) < 1:
+                        LOT_STEP = float(LOT_MIN)
+                except Exception:
+                    pass
+
         print(colored(f"🔧 precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}", "cyan"))
     except Exception as e:
         print(colored(f"⚠️ load_market_specs: {e}", "yellow"))
@@ -131,7 +148,7 @@ compound_pnl = 0.0
 wait_for_next_signal_side = None   # بعد الإغلاق: انتظر إشارة RF المعاكسة (يُحدّث عند الإغلاق)
 last_adx_peak = None               # تتبع قمة ADX الأخيرة لأغراض التبريد
 cond_ini = None                    # نبوّتستراب من التاريخ لكي يطابق Pine
-rf_fdir = 0                        # ★ اتجاه الفلتر (Pine-like stateful): +1 / -1، ويُحافظ عليه عند التساوي
+rf_fdir = 0                        # اتجاه الفلتر (Pine-like stateful): +1/-1
 
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
@@ -142,18 +159,40 @@ STATE = {
 }
 
 def _round_amt(q):
-    if q is None: return 0.0
+    if q is None:
+        return 0.0
+    # حاول استخدام دقة CCXT مباشرة
+    try:
+        if MARKET:
+            v = float(ex.amount_to_precision(SYMBOL, q))
+            # احترام LOT_MIN
+            if LOT_MIN is not None and v < float(LOT_MIN):
+                return 0.0
+            return v
+    except Exception:
+        pass
+    # fallback: step/min/precision
     try:
         d = Decimal(str(q))
-        if LOT_STEP and isinstance(LOT_STEP,(int,float)) and LOT_STEP>0:
+        if LOT_STEP and float(LOT_STEP) > 0:
             step = Decimal(str(LOT_STEP))
             d = (d/step).to_integral_value(rounding=ROUND_DOWN)*step
-        prec = int(AMT_PREC) if AMT_PREC and AMT_PREC>=0 else 0
-        d = d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-        if LOT_MIN and isinstance(LOT_MIN,(int,float)) and LOT_MIN>0 and d < Decimal(str(LOT_MIN)): return 0.0
-        return float(d)
+        else:
+            prec = int(AMT_PREC) if (AMT_PREC is not None) else 0
+            # لو precision=0 لكن min<1، امنح 1 رقم عشري على الأقل
+            if LOT_MIN is not None:
+                try:
+                    if float(LOT_MIN) < 1 and prec == 0:
+                        prec = 1
+                except Exception:
+                    pass
+            d = d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
+        v = float(d)
+        if LOT_MIN is not None and v < float(LOT_MIN):
+            return 0.0
+        return max(0.0, v)
     except (InvalidOperation, ValueError, TypeError):
-        return max(0.0, float(q))
+        return max(0.0, float(q or 0.0))
 
 def safe_qty(q):
     q = _round_amt(q)
@@ -320,25 +359,23 @@ def rf_signal_closed_pine(df: pd.DataFrame):
     f_k   = float(filt.iloc[k])
     f_km1 = float(filt.iloc[km1])
 
-    # ★ Pine-like stateful fdir (retain on equality)
+    # Pine-like stateful fdir (retain on equality)
     if f_k > f_km1:
         rf_fdir = 1
     elif f_k < f_km1:
         rf_fdir = -1
-    # else: keep previous rf_fdir as-is
-
     upward   = 1 if rf_fdir == 1 else 0
     downward = 1 if rf_fdir == -1 else 0
 
-    # Pine long/short prelim conditions (like original)
+    # Pine prelim conditions
     longCond  = (p_k > f_k) and (upward > 0)
     shortCond = (p_k < f_k) and (downward > 0)
 
-    # CondIni update like Pine
+    # CondIni
     prev_cond = cond_ini if cond_ini is not None else 0
     new_cond  = 1 if longCond else (-1 if shortCond else prev_cond)
 
-    # Pine final signals
+    # Final signals
     longSignal  = bool(longCond  and (prev_cond == -1))
     shortSignal = bool(shortCond and (prev_cond ==  1))
 
@@ -356,7 +393,7 @@ def rf_signal_closed_pine(df: pd.DataFrame):
 
 # -------- Bootstrap CondIni from closed history (Pine-exact) ----------
 def bootstrap_cond_ini_from_history(df: pd.DataFrame):
-    """يبني CondIni (والآن rf_fdir) من الشموع المغلقة حتى ما قبل الأخيرة ليطابق Pine."""
+    """يبني CondIni و rf_fdir من الشموع المغلقة ليطابق Pine."""
     global cond_ini, rf_fdir
     try:
         if len(df) < RF_PERIOD + 3:
@@ -385,9 +422,7 @@ def bootstrap_cond_ini_from_history(df: pd.DataFrame):
 
         ci = 0
         rf_fdir_boot = 0
-        # نمشي من أول نقطة متاحة حتى ما قبل آخر بار (كلها شموع مغلقة)
         for i in range(RF_PERIOD + 2, len(df)):
-            if i-1 < 0: continue
             p_k   = float(src.iloc[i])
             f_k   = float(filt.iloc[i])
             f_km1 = float(filt.iloc[i-1])
@@ -396,7 +431,6 @@ def bootstrap_cond_ini_from_history(df: pd.DataFrame):
                 rf_fdir_boot = 1
             elif f_k < f_km1:
                 rf_fdir_boot = -1
-            # else: احتفظ بالحالة
 
             upward   = 1 if rf_fdir_boot == 1 else 0
             downward = 1 if rf_fdir_boot == -1 else 0

@@ -1,22 +1,22 @@
 services:
   - type: web
-    name: sol-bybit-bot
+    name: sui-bybit-bot
     env: python
     plan: free
     region: frankfurt
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py        # ← كان bot_bybit_smart.py
-    healthCheckPath: /
+    startCommand: python main.py
+    healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION             # ← key (مش keys)
+      - key: PYTHON_VERSION
         value: 3.10.14
       - key: PORT
         value: 5000
 
       # السوق/الإعدادات
       - key: SYMBOL
-        value: SOL/USDT:USDT
+        value: SUI/USDT:USDT         # لو حصل Unknown market جرّب SUIUSDT:USDT
       - key: INTERVAL
         value: 15m
       - key: LEVERAGE
@@ -26,46 +26,34 @@ services:
       - key: RISK_ALLOC
         value: "0.60"
 
-      # Range Filter
+      # Range Filter (Pine-exact على الشمعة المغلقة)
       - key: RF_SOURCE
         value: close
       - key: RF_PERIOD
         value: "20"
       - key: RF_MULT
         value: "3.5"
-      - key: RF_LIVE_ONLY
-        value: "true"
-      - key: RF_HYST_BPS
-        value: "6"
 
-      # مؤشرات
+      # مؤشرات (TV-Compat)
       - key: RSI_LEN
         value: "14"
       - key: ADX_LEN
         value: "14"
       - key: ATR_LEN
         value: "14"
-      - key: MAX_SPREAD_BPS
-        value: "8"
 
-      # إدارة الصفقة
-      - key: TP1_PCT_BASE
-        value: "0.40"
-      - key: TP1_CLOSE_FRAC
-        value: "0.50"
-      - key: BREAKEVEN_AFTER
-        value: "0.30"
-      - key: TRAIL_ACTIVATE_PCT
-        value: "1.20"
-      - key: ATR_TRAIL_MULT
-        value: "1.6"
+      # تنفيذ/إغلاق
+      - key: FINAL_CHUNK_QTY
+        value: "0.2"
+      - key: RESIDUAL_MIN_QTY
+        value: "0.05"
 
-      # أسرار Bybit (ضيفها من Secrets)
+      # مفاتيح Bybit (ضيفهم كـ Secrets)
       - key: BYBIT_API_KEY
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
 
-      # Keepalive اختياري
+      # Keepalive (اختياري)
       - key: SELF_URL
         value: ""

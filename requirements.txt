@@ -1,5 +1,5 @@
-flask==2.3.2
-pandas==1.5.3
+flask==3.0.3
+pandas==2.2.2
 ccxt==4.3.89
-termcolor==2.3.0
-requests==2.31.0
+termcolor==2.4.0
+requests==2.32.3

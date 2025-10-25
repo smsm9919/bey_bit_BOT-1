@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-BYBIT — RF-CLOSE FUSION (Entry by RF; supports live-bar like TV) + Council Priority Zone-Reject
+BYBIT — RF FUSION (TV-like RF entries) + Smart Council Priority (Zones + Trend Riding)
 • Exchange: Bybit USDT Perps via CCXT
 • Entry: Range Filter (TradingView-like), supports LIVE-candle flip (TV-like) or CLOSED-candle (Pine-exact)
-• Council (after entry only) + Council Priority Override: SMC (EQH/EQL + OB + FVG + SDZ) + Candles + EVX + Momentum + Fake/Real Break + Retest + Liquidity traps + Zone-Reject override
-• NO partial take-profits, NO ATR trailing. One-shot strict close at 'max-logic' profit (council-confirmed)
-• Cumulative PnL tracking + strict close (reduceOnly) + final-chunk guard (tiny residual) + Flask /metrics /health
+• Council Priority:
+    - Opens/Reverses on strong Supply/Demand zone rejections (strict-close first if opposite).
+    - Demand Priority: open BUY at green box; if no breakout soon → strict close.
+    - Trend Riding: hold positions intelligently until price reaches the opposite box (Long→Supply, Short→Demand),
+                    then close on touch+rejection (smart exit).
+• NO partial take-profits, NO ATR trailing. One-shot strict close at council logic.
+• Cumulative PnL tracking + strict close (reduceOnly) + Flask /metrics /health
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -31,7 +35,7 @@ SELF_URL = os.getenv("SELF_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
 # =================== FIXED CONFIG ===================
-SYMBOL     = "SOL/USDT:USDT"
+SYMBOL     = "SOL/USDT:USDT"   # Bybit Perp
 INTERVAL   = "15m"
 
 LEVERAGE   = 10
@@ -43,7 +47,7 @@ RF_SOURCE        = "close"
 RF_PERIOD        = 20
 RF_MULT          = 3.5
 RF_HYST_BPS      = 0.0
-RF_CLOSED_ONLY   = False   # ← الدخول على الشمعة الحالية زي TradingView
+RF_CLOSED_ONLY   = False   # LIVE-candle like TradingView
 
 # Indicators (RMA/Wilder - TV compat)
 RSI_LEN = 14
@@ -65,12 +69,23 @@ RETEST_MAX_BARS              = 6
 CHOP_ATR_PCTL                = 0.25
 
 # ====== Supply/Demand Reversal (Council Priority Override) ======
-# هذه هي الإضافة الوحيدة المؤثرة على القرار (بدون المساس بمنطق RF)
-ZONE_SD_ENABLED        = True      # تفعيل أولوية المجلس عند رفض الصناديق
-ZONE_TOUCH_BPS         = 15.0      # مدى القرب من حدود الصندوق (bps)
-ZONE_WICK_FRAC_MIN     = 0.55      # طول الذيل كنسبة من مدى الشمعة (قوة الرفض)
-ZONE_VOL_MULT_MIN      = 1.10      # تضخم الحجم مقابل متوسط 20 شمعة (تأكيد)
-ZONE_RETEST_MAX_BARS   = 6         # نافذة إعادة الاختبار
+ZONE_SD_ENABLED        = True
+ZONE_TOUCH_BPS         = 15.0   # قرب من حدود الصندوق (bps)
+ZONE_WICK_FRAC_MIN     = 0.55   # طول الذيل كنسبة من مدى الشمعة
+ZONE_VOL_MULT_MIN      = 1.10   # تضخم الحجم مقابل متوسط 20 شمعة
+ZONE_RETEST_MAX_BARS   = 6      # نافذة إعادة الاختبار
+
+# ====== Demand Priority + Breakout Guard ======
+DEMAND_PRIORITY_ENABLED   = True     # افتح BUY من عند الصندوق الأخضر
+DEMAND_TOUCH_BPS          = 15.0
+DEMAND_BREAKOUT_WAIT_BARS = 6        # عدد الشموع المسموح بها للانطلاقة فوق قمة الصندوق
+DEMAND_BREAKOUT_BPS       = 10.0     # هامش أمان للاختراق فوق قمة الصندوق (bps)
+
+# ====== Trend Riding to Opposite Box (Smart Exit) ======
+TREND_TARGET_ENABLED       = True
+TREND_TARGET_TOUCH_BPS     = 18.0    # قرب من حدود صندوق الهدف (bps)
+TREND_TARGET_REQUIRE_REJ   = True    # اغلق فقط عند لمس + رفض (ذيل مع إغلاق خارج الصندوق)
+TREND_TARGET_WICK_MIN      = 0.50    # حد أدنى لطول الذيل لإثبات الرفض
 
 # Pacing
 BASE_SLEEP   = 5
@@ -115,8 +130,6 @@ def load_market_specs():
         lims = (MARKET.get("limits", {}) or {}).get("amount", {}) or {}
         LOT_STEP = lims.get("step", None)
         LOT_MIN  = lims.get("min",  None)
-
-        # Bybit أحيانًا يضع qtyStep داخل info.lotSizeFilter
         if LOT_STEP is None:
             info = MARKET.get("info", {}) or {}
             lotf = info.get("lotSizeFilter") or info.get("lotSizeFilterV2") or {}
@@ -129,7 +142,6 @@ def load_market_specs():
                         LOT_STEP = float(LOT_MIN)
                 except Exception:
                     pass
-
         print(colored(f"🔧 precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}", "cyan"))
     except Exception as e:
         print(colored(f"⚠️ load_market_specs: {e}", "yellow"))
@@ -152,7 +164,7 @@ except Exception as e:
 
 # =================== HELPERS / STATE ===================
 compound_pnl = 0.0
-wait_for_next_signal_side = None   # سيظل يُحدَّث عند الإغلاق لكن لن يُستخدم لمنع الدخول
+wait_for_next_signal_side = None   # يُحدَّث بعد الإغلاق (للمعلومية فقط)
 last_adx_peak = None
 cond_ini = None
 rf_fdir = 0
@@ -162,12 +174,13 @@ STATE = {
     "pnl": 0.0, "bars": 0,
     "highest_profit_pct": 0.0,
     "breakeven": None,
-    "council": {"votes": 0, "reasons": []}
+    "council": {"votes": 0, "reasons": []},
+    "demand_guard": None,   # {"top": float, "start_bars": int, "max_wait": int}
+    "trend_plan": None      # {"aim":"supply"/"demand", "zbot":float, "ztop":float}
 }
 
 def _round_amt(q):
-    if q is None:
-        return 0.0
+    if q is None: return 0.0
     try:
         if MARKET:
             v = float(ex.amount_to_precision(SYMBOL, q))
@@ -342,8 +355,7 @@ def rf_signal_closed_pine(df: pd.DataFrame):
         rf = [float(x.iloc[0])]
         for i in range(1, len(x)):
             prev = rf[-1]
-            xi = float(x.iloc[i])
-            ri = float(r.iloc[i])
+            xi = float(x.iloc[i]); ri = float(r.iloc[i])
             cur = prev
             if xi - ri > prev:
                 cur = xi - ri
@@ -616,7 +628,7 @@ def detect_trap(df: pd.DataFrame, smc: dict):
         pass
     return None
 
-# =================== ZONE-REJECT (Council Priority Override) ===================
+# =================== ZONE HELPERS ===================
 def _zone_bounds(z):
     if not z: return None, None
     return float(z.get("bot")), float(z.get("top"))
@@ -625,77 +637,57 @@ def _in_zone(px, zbot, ztop):
     a, b = min(zbot, ztop), max(zbot, ztop)
     return a <= px <= b
 
+def _get_supply_zone(smc):
+    if smc.get("sdz") and smc["sdz"].get("side")=="supply": return smc["sdz"]
+    if smc.get("ob")  and smc["ob"].get("side")=="bear":   return smc["ob"]
+    return None
+
+def _get_demand_zone(smc):
+    if smc.get("sdz") and smc["sdz"].get("side")=="demand": return smc["sdz"]
+    if smc.get("ob")  and smc["ob"].get("side")=="bull":    return smc["ob"]
+    return None
+
+# =================== ZONE OVERRIDES (Council Priority) ===================
 def demand_buy_signal(df: pd.DataFrame, smc: dict):
-    """ BUY عند رفض قوي من صندوق Demand/OB bull — لمس/دخول الصندوق ثم إغلاق فوقه + ذيل سفلي طويل. يدعم إعادة الاختبار. """
-    if not ZONE_SD_ENABLED or len(df) < 22: return None
+    """ BUY عند تلامس/دخول Demand ثم إغلاق فوقه (رفض صاعد واضح). """
+    if not (ZONE_SD_ENABLED or DEMAND_PRIORITY_ENABLED) or len(df) < 22: return None
     try:
         o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
         l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
-        rng=max(h-l,1e-12)
-        lower_wick = (min(o,c)-l)/rng
-        v=float(df["volume"].iloc[-2]); vma=float(df["volume"].iloc[-22:-2].astype(float).mean() or 1e-9)
-        vol_mult = v/max(vma,1e-9)
-
-        z = smc.get("sdz") if (smc.get("sdz") or {}).get("side")=="demand" else (smc.get("ob") if (smc.get("ob") or {}).get("side")=="bull" else None)
+        z = _get_demand_zone(smc)
         if not z: return None
         zbot, ztop = _zone_bounds(z)
-
-        near_low  = near_level(l, zbot, ZONE_TOUCH_BPS) or near_level(l, ztop, ZONE_TOUCH_BPS) or _in_zone(l, zbot, ztop)
-        first_touch_reject = near_low and (c > max(zbot,ztop)) and (lower_wick >= ZONE_WICK_FRAC_MIN) and (vol_mult >= ZONE_VOL_MULT_MIN)
-
-        closes = df["close"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
-        lows   = df["low"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
-        retest_touch  = any(near_level(x, zbot, ZONE_TOUCH_BPS) or near_level(x, ztop, ZONE_TOUCH_BPS) or _in_zone(x, zbot, ztop) for x in lows)
-        all_closes_above = all(cc > max(zbot,ztop) for cc in closes) if len(closes)>0 else False
-        this_bar_reject  = near_low and (c > max(zbot,ztop)) and (lower_wick >= ZONE_WICK_FRAC_MIN)
-
+        near_low  = near_level(l, zbot, DEMAND_TOUCH_BPS) or near_level(l, ztop, DEMAND_TOUCH_BPS) or _in_zone(l, zbot, ztop)
+        first_touch_reject = near_low and (c > max(zbot,ztop))
         if first_touch_reject:
-            return {"signal":"buy","why":f"demand_first_reject wick={lower_wick:.2f} volx={vol_mult:.2f} z=[{zbot:.3f},{ztop:.3f}]"}
-        if retest_touch and all_closes_above and this_bar_reject:
-            return {"signal":"buy","why":f"demand_retest_reject wick={lower_wick:.2f} z=[{zbot:.3f},{ztop:.3f}] within {ZONE_RETEST_MAX_BARS} bars"}
+            return {"signal":"buy","why":f"demand_touch_reject z=[{zbot:.3f},{ztop:.3f}]", "top": max(zbot,ztop)}
     except Exception:
         pass
     return None
 
 def supply_sell_signal(df: pd.DataFrame, smc: dict):
-    """ SELL عند رفض قوي من صندوق Supply/OB bear — لمس/دخول الصندوق ثم إغلاق تحته + ذيل علوي طويل. يدعم إعادة الاختبار. """
+    """ SELL عند تلامس/دخول Supply ثم إغلاق تحته (رفض هابط واضح). """
     if not ZONE_SD_ENABLED or len(df) < 22: return None
     try:
         o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
         l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
-        rng=max(h-l,1e-12)
-        upper_wick = (h-max(o,c))/rng
-        v=float(df["volume"].iloc[-2]); vma=float(df["volume"].iloc[-22:-2].astype(float).mean() or 1e-9)
-        vol_mult = v/max(vma,1e-9)
-
-        z = smc.get("sdz") if (smc.get("sdz") or {}).get("side")=="supply" else (smc.get("ob") if (smc.get("ob") or {}).get("side")=="bear" else None)
+        z = _get_supply_zone(smc)
         if not z: return None
         zbot, ztop = _zone_bounds(z)
-
         near_high = near_level(h, zbot, ZONE_TOUCH_BPS) or near_level(h, ztop, ZONE_TOUCH_BPS) or _in_zone(h, zbot, ztop)
-        first_touch_reject = near_high and (c < min(zbot,ztop)) and (upper_wick >= ZONE_WICK_FRAC_MIN) and (vol_mult >= ZONE_VOL_MULT_MIN)
-
-        closes = df["close"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
-        highs  = df["high"].astype(float).iloc[-(ZONE_RETEST_MAX_BARS+1):-1].values
-        retest_touch  = any(near_level(x, zbot, ZONE_TOUCH_BPS) or near_level(x, ztop, ZONE_TOUCH_BPS) or _in_zone(x, zbot, ztop) for x in highs)
-        all_closes_below = all(cc < min(zbot,ztop) for cc in closes) if len(closes)>0 else False
-        this_bar_reject  = near_high and (c < min(zbot,ztop)) and (upper_wick >= ZONE_WICK_FRAC_MIN)
-
+        first_touch_reject = near_high and (c < min(zbot,ztop))
         if first_touch_reject:
-            return {"signal":"sell","why":f"supply_first_reject wick={upper_wick:.2f} volx={vol_mult:.2f} z=[{zbot:.3f},{ztop:.3f}]"}
-        if retest_touch and all_closes_below and this_bar_reject:
-            return {"signal":"sell","why":f"supply_retest_reject wick={upper_wick:.2f} z=[{zbot:.3f},{ztop:.3f}] within {ZONE_RETEST_MAX_BARS} bars"}
+            return {"signal":"sell","why":f"supply_touch_reject z=[{zbot:.3f},{ztop:.3f}]"}
     except Exception:
         pass
     return None
 
 def council_override_entries(df, ind, info, smc):
     """
-    أولوية المجلس: افتح/اعكس عند رفض قوي من Supply/Demand.
-    - لو في صفقة مفتوحة عكس الإشارة → إغلاق صارم ثم فتح الصفقة الجديدة.
-    - لو فلات → فتح فوري.
-    - لو نفس اتجاه المركز الحالي → تجاهُل (لا نضاعف).
-    يرجع True إذا اتخذ إجراء (لتجاوز دخول RF في هذه الدورة).
+    أولوية المجلس:
+      - BUY عند Demand (يُسلّح حراسة اختراق).
+      - SELL عند Supply (انعكاس/فتح مباشر).
+    يرجع True إذا تم إجراء فتح/انعكاس (لتجاوز دخول RF في تلك الدورة).
     """
     zbuy  = demand_buy_signal(df, smc)
     zsell = supply_sell_signal(df, smc)
@@ -703,27 +695,128 @@ def council_override_entries(df, ind, info, smc):
     if not zsig:
         return False
 
-    want_side = "buy" if zsig["signal"]=="buy" else "sell"
+    want_side = "buy" if (zsig and zsig.get("signal")=="buy") else ("sell" if zsell else None)
+    if not want_side: return False
+
     cur_open  = STATE["open"]
     cur_side  = STATE.get("side")
 
-    # عكس مع إغلاق صارم
-    if cur_open and ((cur_side=="long" and want_side=="sell") or (cur_side=="short" and want_side=="buy")):
-        logging.info(f"COUNCIL_OVERRIDE reverse(strict) → {zsig}")
-        close_market_strict(f"COUNCIL_ZONE_{zsig['signal'].upper()}")
-        qty = compute_size(balance_usdt(), info["price"])
-        if qty>0: open_market(want_side, qty, info["price"])
-        return True
+    if want_side == "buy":
+        top = float(zbuy["top"])
+        # لو مفتوح Short → إغلاق صارم ثم فتح BUY
+        if cur_open and cur_side=="short":
+            logging.info(f"COUNCIL_OVERRIDE reverse(strict) → {zbuy}")
+            close_market_strict("COUNCIL_DEMAND_BUY")
+            qty = compute_size(balance_usdt(), info["price"])
+            if qty>0 and open_market("buy", qty, info["price"]):
+                # حراسة اختراق
+                STATE["demand_guard"] = {"top": top, "start_bars": 0, "max_wait": DEMAND_BREAKOUT_WAIT_BARS}
+                # خطة الترند: نحو supply
+                _arm_trend_plan_after_open("long", smc)
+                return True
+        # لو فلات → افتح BUY
+        if not cur_open:
+            qty = compute_size(balance_usdt(), info["price"])
+            if qty>0 and open_market("buy", qty, info["price"]):
+                STATE["demand_guard"] = {"top": top, "start_bars": 0, "max_wait": DEMAND_BREAKOUT_WAIT_BARS}
+                _arm_trend_plan_after_open("long", smc)
+                return True
+        # لو Long موجود لا نضاعف، لكن إن لم توجد حراسة/خطة ترند نُسلّحها
+        if cur_open and cur_side=="long":
+            if not STATE.get("demand_guard"):
+                STATE["demand_guard"] = {"top": top, "start_bars": STATE.get("bars",0), "max_wait": DEMAND_BREAKOUT_WAIT_BARS}
+            if not STATE.get("trend_plan"):
+                _arm_trend_plan_after_open("long", smc)
+            return False
 
-    # فتح مباشر لو فلات
-    if not cur_open:
-        qty = compute_size(balance_usdt(), info["price"])
-        if qty>0:
-            logging.info(f"COUNCIL_OVERRIDE open → {zsig}")
-            open_market(want_side, qty, info["price"])
-            return True
+    if want_side == "sell":
+        if cur_open and cur_side=="long":
+            logging.info(f"COUNCIL_OVERRIDE reverse(strict) → {zsell}")
+            close_market_strict("COUNCIL_SUPPLY_SELL")
+            qty = compute_size(balance_usdt(), info["price"])
+            if qty>0 and open_market("sell", qty, info["price"]):
+                _arm_trend_plan_after_open("short", smc)
+                return True
+        if not cur_open:
+            qty = compute_size(balance_usdt(), info["price"])
+            if qty>0 and open_market("sell", qty, info["price"]):
+                _arm_trend_plan_after_open("short", smc)
+                return True
+        if cur_open and cur_side=="short":
+            if not STATE.get("trend_plan"):
+                _arm_trend_plan_after_open("short", smc)
+            return False
 
     return False
+
+# =================== TREND PLAN (Ride to opposite box) ===================
+def _arm_trend_plan_after_open(side: str, smc: dict):
+    """ يحدد صندوق الهدف المعاكس بعد الفتح (Long→Supply, Short→Demand). """
+    if not TREND_TARGET_ENABLED: 
+        STATE["trend_plan"] = None
+        return
+    if side == "long":
+        sup = _get_supply_zone(smc)
+        if sup:
+            zbot, ztop = _zone_bounds(sup)
+            STATE["trend_plan"] = {"aim":"supply","zbot":zbot,"ztop":ztop}
+            logging.info(f"TREND_PLAN armed → supply [{zbot},{ztop}]")
+        else:
+            STATE["trend_plan"] = None
+    elif side == "short":
+        dem = _get_demand_zone(smc)
+        if dem:
+            zbot, ztop = _zone_bounds(dem)
+            STATE["trend_plan"] = {"aim":"demand","zbot":zbot,"ztop":ztop}
+            logging.info(f"TREND_PLAN armed → demand [{zbot},{ztop}]")
+        else:
+            STATE["trend_plan"] = None
+
+def _trend_plan_should_close(df: pd.DataFrame, side: str, smc: dict):
+    """
+    هل حان وقت الإغلاق الذكي عند صندوق الهدف؟
+    Long → supply touch (+rejection إن مطلوب)
+    Short → demand touch (+rejection إن مطلوب)
+    """
+    if not TREND_TARGET_ENABLED or not STATE.get("trend_plan") or len(df) < 3:
+        return False, None
+
+    plan = STATE["trend_plan"]
+    zbot, ztop = float(plan["zbot"]), float(plan["ztop"])
+    o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
+    l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
+    rng=max(h-l,1e-12)
+    upper_wick = (h-max(o,c))/rng
+    lower_wick = (min(o,c)-l)/rng
+
+    def _touched_high():  # لمس علوي للصندوق
+        return near_level(h, zbot, TREND_TARGET_TOUCH_BPS) or near_level(h, ztop, TREND_TARGET_TOUCH_BPS) or _in_zone(h, zbot, ztop)
+    def _touched_low():   # لمس سفلي للصندوق
+        return near_level(l, zbot, TREND_TARGET_TOUCH_BPS) or near_level(l, ztop, TREND_TARGET_TOUCH_BPS) or _in_zone(l, zbot, ztop)
+
+    if side=="long" and plan["aim"]=="supply":
+        touched = _touched_high()
+        if not touched: return False, None
+        if TREND_TARGET_REQUIRE_REJ:
+            rejected = (c < min(zbot,ztop)) and (upper_wick >= TREND_TARGET_WICK_MIN)
+            if rejected: 
+                return True, f"trend_exit_supply_reject wick={upper_wick:.2f} z=[{zbot:.3f},{ztop:.3f}]"
+            return False, None
+        else:
+            return True, f"trend_exit_supply_touch z=[{zbot:.3f},{ztop:.3f}]"
+
+    if side=="short" and plan["aim"]=="demand":
+        touched = _touched_low()
+        if not touched: return False, None
+        if TREND_TARGET_REQUIRE_REJ:
+            rejected = (c > max(zbot,ztop)) and (lower_wick >= TREND_TARGET_WICK_MIN)
+            if rejected:
+                return True, f"trend_exit_demand_reject wick={lower_wick:.2f} z=[{zbot:.3f},{ztop:.3f}]"
+            return False, None
+        else:
+            return True, f"trend_exit_demand_touch z=[{zbot:.3f},{ztop:.3f}]"
+
+    return False, None
 
 # =================== COUNCIL DECISION ===================
 def council_assess(df, ind, info, smc, cache):
@@ -781,7 +874,7 @@ def council_assess(df, ind, info, smc, cache):
     if detect_retest(df, l_for_retest, "long" if side=="long" else "short"):
         votes.append("retest_touched")
 
-    # 5.5) Liquidity Grab — تصويت داعم أثناء الصفقة (BSL/SSL)
+    # 5.5) Liquidity Grab
     try:
         if len(df) >= 22:
             o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
@@ -791,30 +884,13 @@ def council_assess(df, ind, info, smc, cache):
             lower_wick = (min(o,c)-l)/rng
             v=float(df["volume"].iloc[-2]); vma=float(df["volume"].iloc[-22:-2].astype(float).mean() or 1e-9)
             vol_mult = v / max(vma, 1e-9)
-
-            wick_frac_min = 0.60
-            vol_mult_min  = 1.20
-            level_bps     = 12.0
-
+            wick_frac_min = 0.60; vol_mult_min = 1.20; level_bps = 12.0
             eqh = smc.get("eqh"); eql = smc.get("eql")
             bsl = bool(eqh and h>eqh and c<eqh and upper_wick>=wick_frac_min and vol_mult>=vol_mult_min)
             ssl = bool(eql and l<eql and c>eql and lower_wick>=wick_frac_min and vol_mult>=vol_mult_min)
-
             if bsl or ssl:
                 grab = "BSL" if bsl else "SSL"
                 votes.append(f"liq_grab:{grab}")
-
-                px_ref = h if bsl else l
-                ob, sdz, fvg = smc.get("ob"), smc.get("sdz"), smc.get("fvg")
-                near_struct = False
-                if ob:
-                    near_struct |= near_level(px_ref, ob.get("bot", px_ref), level_bps) or near_level(px_ref, ob.get("top", px_ref), level_bps)
-                if sdz:
-                    near_struct |= near_level(px_ref, sdz.get("bot", px_ref), level_bps) or near_level(px_ref, sdz.get("top", px_ref), level_bps)
-                if fvg:
-                    near_struct |= near_level(px_ref, fvg.get("bottom", px_ref), level_bps) or near_level(px_ref, fvg.get("top", px_ref), level_bps)
-                if near_struct:
-                    votes.append("liq_grab_near_struct")
     except Exception:
         pass
 
@@ -880,7 +956,8 @@ def open_market(side, qty, price):
         "open": True, "side": "long" if side=="buy" else "short", "entry": price,
         "qty": qty, "pnl": 0.0, "bars": 0,
         "highest_profit_pct": 0.0, "breakeven": None,
-        "council": {"votes": 0, "reasons": []}
+        "council": {"votes": 0, "reasons": []},
+        "trend_plan": STATE.get("trend_plan", None)  # set by _arm_trend_plan_after_open
     })
     print(colored(f"🚀 OPEN {('🟩 LONG' if side=='buy' else '🟥 SHORT')} qty={fmt(qty,4)} @ {fmt(price)}", "green" if side=='buy' else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -927,9 +1004,9 @@ def _reset_after_close(reason, prev_side=None):
     STATE.update({
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "highest_profit_pct": 0.0,
-        "breakeven": None, "council": {"votes":0,"reasons":[]}
+        "breakeven": None, "council": {"votes":0,"reasons":[]},
+        "demand_guard": None, "trend_plan": None
     })
-    # نحافظ على التحديث لكن مش هنستخدمه لمنع دخول جديد (للتطابق مع TV)
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
     else: wait_for_next_signal_side = None
@@ -944,6 +1021,40 @@ def manage_after_entry(df, ind, info, smc):
     if rr > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = rr
 
+    # ===== Demand Breakout Guard (يحمي صفقات الشراء من التورط داخل الصندوق) =====
+    try:
+        guard = STATE.get("demand_guard")
+        if guard and side=="long":
+            top = float(guard["top"])
+            if len(df) >= 2:
+                c_prev = float(df["close"].iloc[-2])
+                breakout_ok = ( (c_prev - top)/max(top,1e-9) )*10000.0 >= DEMAND_BREAKOUT_BPS
+            else:
+                breakout_ok = False
+            if breakout_ok:
+                logging.info(f"DEMAND_GUARD success breakout above top={top}")
+                STATE["demand_guard"] = None
+            else:
+                waited = int(STATE.get("bars",0))
+                if waited >= int(guard.get("max_wait", DEMAND_BREAKOUT_WAIT_BARS)):
+                    logging.info(f"DEMAND_GUARD timeout (waited={waited}) — strict close (no breakout above top={top})")
+                    close_market_strict("DEMAND_NO_BREAKOUT")
+                    STATE["demand_guard"] = None
+                    return
+    except Exception as _e:
+        logging.error(f"DEMAND_GUARD error: {_e}")
+
+    # ===== Trend Riding Exit (إغلاق ذكي عند الصندوق المقابل) =====
+    try:
+        should_close, why = _trend_plan_should_close(df, side, smc)
+        if should_close:
+            logging.info(f"TREND_PLAN close → {why}")
+            close_market_strict(why)
+            return
+    except Exception as _e:
+        logging.error(f"TREND_PLAN error: {_e}")
+
+    # ===== Council Strict Exit (تصويت عام) =====
     decision = council_assess(df, ind, info, smc, STATE.get("council", {}))
     if decision["decision"] == "exit_strict":
         close_market_strict("COUNCIL_MAX_PROFIT_CONFIRMED")
@@ -965,12 +1076,15 @@ def pretty_snapshot(bal, info, ind, smc, reason=None, df=None):
     print(f"   🏗️ SMC: EQH={fmt(smc.get('eqh'))}  EQL={fmt(smc.get('eql'))}  OB={smc.get('ob')}  FVG={smc.get('fvg')}  SDZ={smc.get('sdz')}")
     print(f"   ⏱️ closes_in ≈ {left_s}s")
 
-    # توضيح إشارة الصناديق (اختياري للمتابعة)
     try:
         _zbuy = demand_buy_signal(df, smc)
         _zsel = supply_sell_signal(df, smc)
         if _zbuy: print(colored(f"   🧱 Zone Override: BUY ({_zbuy['why']})", "magenta"))
         if _zsel: print(colored(f"   🧱 Zone Override: SELL ({_zsel['why']})", "magenta"))
+        if STATE.get("trend_plan"):
+            tp=STATE["trend_plan"]; print(colored(f"   🎯 Trend Plan → {tp['aim'].upper()} [{fmt(tp['zbot'])},{fmt(tp['ztop'])}]", "green"))
+        if STATE.get("demand_guard"):
+            dg=STATE["demand_guard"]; print(colored(f"   🛡️ Demand Guard top={fmt(dg['top'])} wait≤{dg['max_wait']} bars", "yellow"))
     except Exception:
         pass
 
@@ -1012,17 +1126,17 @@ def trade_loop():
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
 
-            # أولوية المجلس: لو نفّذ إجراء (فتح/انعكاس بإغلاق صارم) بسبب رفض الصناديق — نتخطّى دخول RF هذه الدورة
+            # أولوية المجلس (قد تفتح/تعكس وتسلّح الحراسة وخطة الترند)
             if council_override_entries(df, ind, {"price": px or info["price"], **info}, smc):
                 pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, smc, "council_override", df)
                 loop_i += 1
                 time.sleep(BASE_SLEEP)
                 continue
 
-            # إدارة المجلس (ما بعد الدخول)
+            # إدارة ما بعد الدخول: حراسة الطلب + ركوب الترند + تصويت عام
             manage_after_entry(df, ind, {"price": px or info["price"], **info}, smc)
 
-            # ENTRY: زي TV — لو في إشارة افتح فورًا (بدون انتظار الإشارة المعاكسة)
+            # ENTRY: RF فقط (لا ننتظر إشارة معاكسة)
             reason=None
             sig = "buy" if info["long"] else ("sell" if info["short"] else None)
             if (not STATE["open"]) and sig:
@@ -1030,7 +1144,10 @@ def trade_loop():
                 raw_qty = ((bal or 0.0)*RISK_ALLOC*LEVERAGE)/max(px or info["price"] or 1e-9,1e-9)
                 logging.info(f"QTY_DEBUG bal={fmt(bal,4)} price={fmt(px or info['price'])} raw={fmt(raw_qty,8)} -> qty={fmt(qty,8)} min={LOT_MIN} step={LOT_STEP} prec={AMT_PREC}")
                 if qty>0:
-                    open_market(sig, qty, px or info["price"])
+                    if open_market(sig, qty, px or info["price"]):
+                        # بعد فتح RF، نسلّح خطة الترند تجاه الصندوق المقابل
+                        side_now = "long" if sig=="buy" else "short"
+                        _arm_trend_plan_after_open(side_now, smc)
                 else:
                     reason="qty<=0"
 
@@ -1054,7 +1171,7 @@ app = Flask(__name__)
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
     mode_entry = "RF_LIVE (TV-like)" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY (Pine-exact)"
-    return f"✅ RF FUSION — {SYMBOL} {INTERVAL} — {mode} — Entry: {mode_entry} — Council strict-exit + ZoneOverride — FinalChunk={FINAL_CHUNK_QTY}"
+    return f"✅ RF FUSION — {SYMBOL} {INTERVAL} — {mode} — Entry: {mode_entry} — Council Priority + TrendRide — FinalChunk={FINAL_CHUNK_QTY}"
 
 @app.route("/metrics")
 def metrics():
@@ -1063,7 +1180,8 @@ def metrics():
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "RF_LIVE" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY_PINE",
-        "zone_override": ZONE_SD_ENABLED
+        "zone_override": ZONE_SD_ENABLED,
+        "trend_target_enabled": TREND_TARGET_ENABLED
     })
 
 @app.route("/health")
@@ -1074,7 +1192,8 @@ def health():
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "RF_LIVE" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY_PINE",
         "council_votes": STATE.get("council",{}).get("votes",0),
-        "zone_override": ZONE_SD_ENABLED
+        "zone_override": ZONE_SD_ENABLED,
+        "trend_target_enabled": TREND_TARGET_ENABLED
     }), 200
 
 def keepalive_loop():
@@ -1094,7 +1213,7 @@ def keepalive_loop():
 if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ENTRY={'RF_LIVE (TV-like)' if not RF_CLOSED_ONLY else 'RF_CLOSED_ONLY (Pine-exact)'}", "yellow"))
-    print(colored(f"NO TPs/NO TRAIL • STRICT EXIT by COUNCIL • ZoneOverride ENABLED={ZONE_SD_ENABLED} • FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
+    print(colored(f"COUNCIL PRIORITY ✓  TREND RIDE ✓  DEMAND GUARD ✓  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))

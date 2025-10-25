@@ -1,43 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-BYBIT — RF-CLOSE FUSION (Entry by RF only, CLOSED candle, Pine-exact)
-• Exchange: Bybit USDT Perps via CCXT
-• Entry: Range Filter (TradingView-like), CLOSED-candle flip only (Pine-exact B&S logic)
-• Council (after entry only): SMC (EQH/EQL + OB + FVG + SDZ) + Candles + EVX + Momentum + Fake/Real Break + Retest + Liquidity traps
-• NO partial take-profits, NO ATR trailing. One-shot strict close at 'max-logic' profit (council-confirmed)
-• Cumulative PnL tracking + strict close (reduceOnly) + final-chunk guard + Flask /metrics /health
-• Robust order execution (debounce + retries + exchange verification) — like DOGE/BingX bot
-"""
-
-import os, time, math, random, signal, sys, traceback, logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime
-import pandas as pd
-import numpy as np
-import ccxt
-from flask import Flask, jsonify
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
-
-try:
-    from termcolor import colored
-except Exception:
-    def colored(t,*a,**k): return t
-
-# =================== ENV / MODE ===================
-API_KEY = os.getenv("BYBIT_API_KEY", "") or os.getenv("BINGX_API_KEY","")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "") or os.getenv("BINGX_API_SECRET","")
-MODE_LIVE = bool(API_KEY and API_SECRET)
-
-SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL","")
-PORT = int(os.getenv("PORT", 5000))
-
-# =================== FIXED CONFIG ===================
-SYMBOL     = os.getenv("SYMBOL", "SUI/USDT:USDT")  # إن ظهر Unknown market جرّب "SUIUSDT:USDT"
-INTERVAL   = os.getenv("INTERVAL","15m")
-
-LEVERAGE   = int(os.getenv("LEVERAGE", 10))
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
-POSITION_MODE = os.getenv("POSITION_MODE","oneway")
 
 # Range Filter (TV-like)
 RF_SOURCE        = "close"

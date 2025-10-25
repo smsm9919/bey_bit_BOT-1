@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-BYBIT — RF-CLOSE FUSION (Entry by RF only, CLOSED candle, Pine-exact)
+BYBIT — RF-CLOSE FUSION (Entry by RF; supports live-bar like TV)
 • Exchange: Bybit USDT Perps via CCXT
-• Entry: Range Filter (TradingView-like), CLOSED-candle flip only (Pine-exact B&S logic)
+• Entry: Range Filter (TradingView-like), supports LIVE-candle flip (TV-like) or CLOSED-candle (Pine-exact)
 • Council (after entry only): SMC (EQH/EQL + OB + FVG + SDZ) + Candles + EVX + Momentum + Fake/Real Break + Retest + Liquidity traps
 • NO partial take-profits, NO ATR trailing. One-shot strict close at 'max-logic' profit (council-confirmed)
 • Cumulative PnL tracking + strict close (reduceOnly) + final-chunk guard (tiny residual) + Flask /metrics /health
@@ -38,12 +38,12 @@ LEVERAGE   = 10
 RISK_ALLOC = 0.60
 POSITION_MODE = "oneway"
 
-# Range Filter (TV-like)
+# Range Filter (TV-like). ← الدخول حيّ زي TV
 RF_SOURCE        = "close"
 RF_PERIOD        = 20
 RF_MULT          = 3.5
-RF_HYST_BPS      = 0.0           # Pine copy uses no extra hysteresis
-RF_CLOSED_ONLY   = True          # دخول على الشمعة المغلقة فقط
+RF_HYST_BPS      = 0.0
+RF_CLOSED_ONLY   = False   # ← الدخول على الشمعة الحالية زي TradingView
 
 # Indicators (RMA/Wilder - TV compat)
 RSI_LEN = 14
@@ -108,7 +108,7 @@ def load_market_specs():
         LOT_STEP = lims.get("step", None)
         LOT_MIN  = lims.get("min",  None)
 
-        # ★ إصلاح Bybit: أحيانًا step لا يظهر في limits، بل في info.lotSizeFilter.qtyStep
+        # Bybit أحيانًا يضع qtyStep داخل info.lotSizeFilter
         if LOT_STEP is None:
             info = MARKET.get("info", {}) or {}
             lotf = info.get("lotSizeFilter") or info.get("lotSizeFilterV2") or {}
@@ -116,7 +116,6 @@ def load_market_specs():
             if qstep is not None:
                 LOT_STEP = float(qstep)
             elif LOT_MIN is not None:
-                # fallback آمن: لو الحد الأدنى أقل من 1 فاعتبره خطوة دنيا
                 try:
                     if float(LOT_MIN) < 1:
                         LOT_STEP = float(LOT_MIN)
@@ -145,10 +144,10 @@ except Exception as e:
 
 # =================== HELPERS / STATE ===================
 compound_pnl = 0.0
-wait_for_next_signal_side = None   # بعد الإغلاق: انتظر إشارة RF المعاكسة (يُحدّث عند الإغلاق)
-last_adx_peak = None               # تتبع قمة ADX الأخيرة لأغراض التبريد
-cond_ini = None                    # نبوّتستراب من التاريخ لكي يطابق Pine
-rf_fdir = 0                        # اتجاه الفلتر (Pine-like stateful): +1/-1
+wait_for_next_signal_side = None   # سيظل يُحدَّث عند الإغلاق لكن لن يُستخدم لمنع الدخول
+last_adx_peak = None
+cond_ini = None
+rf_fdir = 0
 
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
@@ -161,17 +160,14 @@ STATE = {
 def _round_amt(q):
     if q is None:
         return 0.0
-    # حاول استخدام دقة CCXT مباشرة
     try:
         if MARKET:
             v = float(ex.amount_to_precision(SYMBOL, q))
-            # احترام LOT_MIN
             if LOT_MIN is not None and v < float(LOT_MIN):
                 return 0.0
             return v
     except Exception:
         pass
-    # fallback: step/min/precision
     try:
         d = Decimal(str(q))
         if LOT_STEP and float(LOT_STEP) > 0:
@@ -179,7 +175,6 @@ def _round_amt(q):
             d = (d/step).to_integral_value(rounding=ROUND_DOWN)*step
         else:
             prec = int(AMT_PREC) if (AMT_PREC is not None) else 0
-            # لو precision=0 لكن min<1، امنح 1 رقم عشري على الأقل
             if LOT_MIN is not None:
                 try:
                     if float(LOT_MIN) < 1 and prec == 0:
@@ -307,14 +302,13 @@ def compute_indicators(df: pd.DataFrame):
         "atr_pctl": atr_pctl
     }
 
-# =================== RANGE FILTER — Pine-exact (CLOSED candle) ===================
+# =================== RANGE FILTER — Pine-exact (supports LIVE/CLOSED) ===================
 def rf_signal_closed_pine(df: pd.DataFrame):
     """
-    Pine-exact of 'Range Filter - B&S Signals' (DonovanWall) with CondIni logic:
-    - Work on last CLOSED candle (k=-2 vs -3).
-    - longSignal / shortSignal identical to Pine's longCondition/shortCondition.
-    - fdir is stateful like Pine: retains last direction when filt==filt[1].
-    - No extra hysteresis; follows rng_size/rng_filt + fdir rules exactly.
+    Range Filter - B&S Signals logic:
+    - If RF_CLOSED_ONLY=True → يعمل على الشمعة المغلقة الأخيرة (Pine-exact).
+    - If RF_CLOSED_ONLY=False → يعمل على الشمعة الحالية (TV-like live).
+    - CondIni يستخدم حالة الشمعة السابقة (equivalent to CondIni[1] في Pine).
     """
     global cond_ini, rf_fdir
     need = RF_PERIOD + 3
@@ -353,13 +347,17 @@ def rf_signal_closed_pine(df: pd.DataFrame):
 
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
 
-    # last CLOSED candle index
-    k, km1 = -2, -3
+    # اختيار الشمعة: مغلقة أو حية (TV-like)
+    if RF_CLOSED_ONLY:
+        k, km1 = -2, -3   # closed bar
+    else:
+        k, km1 = -1, -2   # live bar (TV)
+
     p_k   = float(src.iloc[k])
     f_k   = float(filt.iloc[k])
     f_km1 = float(filt.iloc[km1])
 
-    # Pine-like stateful fdir (retain on equality)
+    # fdir stateful (retain direction when equal)
     if f_k > f_km1:
         rf_fdir = 1
     elif f_k < f_km1:
@@ -367,15 +365,15 @@ def rf_signal_closed_pine(df: pd.DataFrame):
     upward   = 1 if rf_fdir == 1 else 0
     downward = 1 if rf_fdir == -1 else 0
 
-    # Pine prelim conditions
+    # prelim conditions
     longCond  = (p_k > f_k) and (upward > 0)
     shortCond = (p_k < f_k) and (downward > 0)
 
-    # CondIni
+    # CondIni: use previous state (equiv to CondIni[1])
     prev_cond = cond_ini if cond_ini is not None else 0
     new_cond  = 1 if longCond else (-1 if shortCond else prev_cond)
 
-    # Final signals
+    # final signals (Pine B&S)
     longSignal  = bool(longCond  and (prev_cond == -1))
     shortSignal = bool(shortCond and (prev_cond ==  1))
 
@@ -383,7 +381,7 @@ def rf_signal_closed_pine(df: pd.DataFrame):
 
     return {
         "time": int(df["time"].iloc[k]),
-        "price": float(src.iloc[-1]),     # current price only for display
+        "price": float(src.iloc[-1]),
         "long": longSignal,
         "short": shortSignal,
         "filter": f_k,
@@ -391,9 +389,9 @@ def rf_signal_closed_pine(df: pd.DataFrame):
         "lo": float(lo.iloc[k]),
     }
 
-# -------- Bootstrap CondIni from closed history (Pine-exact) ----------
+# -------- Bootstrap CondIni from closed history ----------
 def bootstrap_cond_ini_from_history(df: pd.DataFrame):
-    """يبني CondIni و rf_fdir من الشموع المغلقة ليطابق Pine."""
+    """يبني CondIni و rf_fdir من التاريخ المغلق ليطابق Pine عند التشغيل."""
     global cond_ini, rf_fdir
     try:
         if len(df) < RF_PERIOD + 3:
@@ -440,7 +438,7 @@ def bootstrap_cond_ini_from_history(df: pd.DataFrame):
 
         cond_ini = ci
         rf_fdir  = rf_fdir_boot
-        print(colored(f"🔧 CondIni bootstrapped from history → {cond_ini} | rf_fdir={rf_fdir}", "cyan"))
+        print(colored(f"🔧 CondIni bootstrapped → {cond_ini} | rf_fdir={rf_fdir}", "cyan"))
     except Exception as e:
         print(colored(f"⚠️ bootstrap CondIni error: {e}", "yellow"))
         if cond_ini is None: cond_ini = 0
@@ -666,6 +664,43 @@ def council_assess(df, ind, info, smc, cache):
     if detect_retest(df, l_for_retest, "long" if side=="long" else "short"):
         votes.append("retest_touched")
 
+    # 5.5) Liquidity Grab — تصويت داعم أثناء الصفقة (BSL/SSL)
+    try:
+        if len(df) >= 22:
+            o=float(df["open"].iloc[-2]); h=float(df["high"].iloc[-2])
+            l=float(df["low"].iloc[-2]);  c=float(df["close"].iloc[-2])
+            rng=max(h-l,1e-12)
+            upper_wick = (h-max(o,c))/rng
+            lower_wick = (min(o,c)-l)/rng
+            v=float(df["volume"].iloc[-2]); vma=float(df["volume"].iloc[-22:-2].astype(float).mean() or 1e-9)
+            vol_mult = v / max(vma, 1e-9)
+
+            wick_frac_min = 0.60
+            vol_mult_min  = 1.20
+            level_bps     = 12.0
+
+            eqh = smc.get("eqh"); eql = smc.get("eql")
+            bsl = bool(eqh and h>eqh and c<eqh and upper_wick>=wick_frac_min and vol_mult>=vol_mult_min)
+            ssl = bool(eql and l<eql and c>eql and lower_wick>=wick_frac_min and vol_mult>=vol_mult_min)
+
+            if bsl or ssl:
+                grab = "BSL" if bsl else "SSL"
+                votes.append(f"liq_grab:{grab}")
+
+                px_ref = h if bsl else l
+                ob, sdz, fvg = smc.get("ob"), smc.get("sdz"), smc.get("fvg")
+                near_struct = False
+                if ob:
+                    near_struct |= near_level(px_ref, ob.get("bot", px_ref), level_bps) or near_level(px_ref, ob.get("top", px_ref), level_bps)
+                if sdz:
+                    near_struct |= near_level(px_ref, sdz.get("bot", px_ref), level_bps) or near_level(px_ref, sdz.get("top", px_ref), level_bps)
+                if fvg:
+                    near_struct |= near_level(px_ref, fvg.get("bottom", px_ref), level_bps) or near_level(px_ref, fvg.get("top", px_ref), level_bps)
+                if near_struct:
+                    votes.append("liq_grab_near_struct")
+    except Exception:
+        pass
+
     # 6) سوق نايم
     atr_pctl = ind.get("atr_pctl")
     if atr_pctl is not None and atr_pctl <= CHOP_ATR_PCTL and near_any and cndl["pattern"] in ("DOJI","SHOOTING","HAMMER"):
@@ -777,7 +812,7 @@ def _reset_after_close(reason, prev_side=None):
         "pnl": 0.0, "bars": 0, "highest_profit_pct": 0.0,
         "breakeven": None, "council": {"votes":0,"reasons":[]}
     })
-    # انتظر إشارة RF المعاكسة قبل دخول جديد
+    # نحافظ على التحديث لكن مش هنستخدمه لمنع دخول جديد (للتطابق مع TV)
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
     else: wait_for_next_signal_side = None
@@ -806,7 +841,7 @@ def pretty_snapshot(bal, info, ind, smc, reason=None, df=None):
     print(colored("─"*110,"cyan"))
     print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
     print(colored("─"*110,"cyan"))
-    print("📈 RF (CLOSED, Pine-exact) & INDICATORS (TV-Compat)")
+    print("📈 RF (LIVE/CLOSED) & INDICATORS (TV-Compat)")
     print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
     print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}  ATRpctl={fmt(ind.get('atr_pctl'),3)}")
     print(f"   💥 EVX: strong={'Yes' if evx.get('explosion') else 'No'}  ratio={fmt(evx.get('ratio'),2)} react={fmt(evx.get('react'),2)}  candle={cndl.get('pattern')}")
@@ -822,27 +857,24 @@ def pretty_snapshot(bal, info, ind, smc, reason=None, df=None):
         print(f"   🧠 Council: votes={STATE['council']['votes']} reasons={STATE['council']['reasons']}")
     else:
         print("   ⚪ FLAT")
-        if wait_for_next_signal_side:
-            print(colored(f"   ⏳ Waiting opposite RF: {wait_for_next_signal_side.upper()}", "cyan"))
     if reason: print(colored(f"   ℹ️ reason: {reason}", "white"))
     print(colored("─"*110,"cyan"))
 
 # =================== LOOP ===================
 def trade_loop():
     loop_i=0
-    last_side = None
     while True:
         try:
             bal = balance_usdt()
             px  = price_now()
             df  = fetch_ohlcv()
 
-            # أول تشغيل فقط: ابنِ CondIni من التاريخ المغلق ليطابق Pine
+            # Bootstrap CondIni من التاريخ المغلق فقط عند أول مرة
             if cond_ini is None:
                 df_closed_init = df.iloc[:-1] if len(df) >= 2 else df.copy()
                 bootstrap_cond_ini_from_history(df_closed_init)
 
-            # RF Pine-exact on CLOSED candle
+            # RF (LIVE/CLOSED حسب الإعداد)
             info = rf_signal_closed_pine(df)
             ind  = compute_indicators(df)
 
@@ -857,22 +889,17 @@ def trade_loop():
             # إدارة المجلس
             manage_after_entry(df, ind, {"price": px or info["price"], **info}, smc)
 
-            # ENTRY: RF CLOSED ONLY — مع انتظار الإشارة المعاكسة بعد الإغلاق
+            # ENTRY: زي TV — لو في إشارة افتح فورًا (بدون انتظار الإشارة المعاكسة)
             reason=None
             sig = "buy" if info["long"] else ("sell" if info["short"] else None)
             if (not STATE["open"]) and sig:
-                if wait_for_next_signal_side and sig != wait_for_next_signal_side:
-                    reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
+                qty = compute_size(bal, px or info["price"])
+                raw_qty = ((bal or 0.0)*RISK_ALLOC*LEVERAGE)/max(px or info["price"] or 1e-9,1e-9)
+                logging.info(f"QTY_DEBUG bal={fmt(bal,4)} price={fmt(px or info['price'])} raw={fmt(raw_qty,8)} -> qty={fmt(qty,8)} min={LOT_MIN} step={LOT_STEP} prec={AMT_PREC}")
+                if qty>0:
+                    open_market(sig, qty, px or info["price"])
                 else:
-                    qty = compute_size(bal, px or info["price"])
-                    raw_qty = ((bal or 0.0)*RISK_ALLOC*LEVERAGE)/max(px or info["price"] or 1e-9,1e-9)
-                    logging.info(f"QTY_DEBUG bal={fmt(bal,4)} price={fmt(px or info['price'])} raw={fmt(raw_qty,8)} -> qty={fmt(qty,8)} min={LOT_MIN} step={LOT_STEP} prec={AMT_PREC}")
-                    if qty>0:
-                        open_market(sig, qty, px or info["price"])
-                        last_side = sig
-                        wait_for_next_signal_side = None
-                    else:
-                        reason="qty<=0"
+                    reason="qty<=0"
 
             pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, smc, reason, df)
 
@@ -893,7 +920,8 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF-CLOSE FUSION — {SYMBOL} {INTERVAL} — {mode} — Entry: RF CLOSED (Pine-exact) — Council strict-exit — FinalChunk={FINAL_CHUNK_QTY}"
+    mode_entry = "RF_LIVE (TV-like)" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY (Pine-exact)"
+    return f"✅ RF FUSION — {SYMBOL} {INTERVAL} — {mode} — Entry: {mode_entry} — Council strict-exit — FinalChunk={FINAL_CHUNK_QTY}"
 
 @app.route("/metrics")
 def metrics():
@@ -901,7 +929,8 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "RF_CLOSED_ONLY_PINE", "waiting_for": wait_for_next_signal_side
+        "entry_mode": "RF_LIVE" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY_PINE",
+        "waiting_for": None  # لم نعد نستخدمه كحارس دخول
     })
 
 @app.route("/health")
@@ -910,7 +939,8 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "RF_CLOSED_ONLY_PINE", "council_votes": STATE.get("council",{}).get("votes",0)
+        "entry_mode": "RF_LIVE" if not RF_CLOSED_ONLY else "RF_CLOSED_ONLY_PINE",
+        "council_votes": STATE.get("council",{}).get("votes",0)
     }), 200
 
 def keepalive_loop():
@@ -919,7 +949,7 @@ def keepalive_loop():
         print(colored("⛔ keepalive disabled (SELF_URL not set)", "yellow"))
         return
     import requests
-    sess=requests.Session(); sess.headers.update({"User-Agent":"rf-close/keepalive"})
+    sess=requests.Session(); sess.headers.update({"User-Agent":"rf-live/keepalive"})
     print(colored(f"KEEPALIVE every 50s → {url}", "cyan"))
     while True:
         try: sess.get(url, timeout=8)
@@ -929,7 +959,7 @@ def keepalive_loop():
 # =================== BOOT ===================
 if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ENTRY=RF_CLOSED_ONLY (Pine-exact)", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ENTRY={'RF_LIVE (TV-like)' if not RF_CLOSED_ONLY else 'RF_CLOSED_ONLY (Pine-exact)'}", "yellow"))
     print(colored(f"NO TPs/NO TRAIL • STRICT EXIT by COUNCIL • FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
